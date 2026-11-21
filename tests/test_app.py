@@ -288,6 +288,57 @@ def test_owner_offboards_tenant_with_wallet_refund(c, monkeypatch):
         A.q("delete from tenants where id=?", (tenant_id,))
 
 
+def test_offboard_no_deductions_via_whatsapp_sends_payout_and_notifies_tenant(c, monkeypatch):
+    async def wallet(*args, **kwargs):
+        return {"available_balance": 10000.0, "ledger_balance": 10000.0, "source": "cashfree", "updated_at": ""}
+
+    monkeypatch.setattr(A, "cashfree_wallet", wallet)
+    A.q("insert into tenants(name,phone,room,rent,deposit,language) values('Offboard Test','9000000777','105',1000,2000,'en')")
+    tenant_id = A.q.last
+    A.q("insert into ledger(tenant_id,month,due,paid,status) values(?,?,1000,1000,'paid')", (tenant_id, A.month()))
+    try:
+        # 1. Owner asks to offboard tenant on WhatsApp
+        c.post("/whatsapp/simulate", data={"text": "offboard Offboard Test"})
+        msgs = [m for m in c.get("/messages").json() if m["role"] == "owner" and m["direction"] == "out"]
+        assert any("deduction" in m["text"].lower() for m in msgs)
+
+        # 2. Owner replies on WhatsApp with "no deductions"
+        c.post("/whatsapp/simulate", data={"text": "no deductions"})
+
+        # 3. Tenant status updated to moved_out
+        assert A.q("select status from tenants where id=?", (tenant_id,))[0]["status"] == "moved_out"
+
+        # 4. Offboard status updated to refunded
+        ob = A.q("select * from offboards where tenant_id=?", (tenant_id,))[0]
+        assert ob["status"] == "refunded"
+        assert ob["refund"] == 2000
+
+        # 5. Payout status updated to success
+        po = A.q("select * from payouts where offboard_id=?", (ob["id"],))[0]
+        assert po["status"] == "success"
+        assert po["amount"] == 2000
+
+        # 6. Tenant was notified on WhatsApp with deposit refund details
+        tenant_msgs = A.q("select * from messages where role='tenant' and phone='9000000777'")
+        assert len(tenant_msgs) > 0
+        assert any("2000" in m["text"] and "Cashfree" in m["text"] for m in tenant_msgs)
+
+        # 7. Owner was confirmed on WhatsApp
+        owner_latest = [m for m in c.get("/messages").json() if m["role"] == "owner" and m["direction"] == "out"][-1]
+        assert "2000" in owner_latest["text"] or "2,000" in owner_latest["text"] or "₹" in owner_latest["text"]
+    finally:
+        obs = A.q("select id from offboards where tenant_id=?", (tenant_id,))
+        if obs:
+            payees = A.q("select payee_id from payouts where offboard_id=?", (obs[0]["id"],))
+            A.q("delete from payouts where offboard_id=?", (obs[0]["id"],))
+            if payees:
+                A.q("delete from payees where id=?", (payees[0]["payee_id"],))
+            A.q("delete from offboards where id=?", (obs[0]["id"],))
+        A.q("delete from messages where phone='9000000777'")
+        A.q("delete from ledger where tenant_id=?", (tenant_id,))
+        A.q("delete from tenants where id=?", (tenant_id,))
+
+
 def test_pg_facts_for_the_voice_agent(c):
     f = A.pg_facts()
     occupied = sum(len(r["occupants"]) for r in c.get("/rooms").json())

@@ -451,6 +451,39 @@ async def t_prepare_payout(amount, reason="repair", payee_id=None, payee_name=No
             "status": "pending_confirm"}
 
 
+async def notify_tenant_refund(offboard_id, refund_amount, transfer_id=None):
+    ob_rows = q("select * from offboards where id=?", (offboard_id,))
+    if not ob_rows:
+        return
+    ob = ob_rows[0]
+    t_rows = q("select * from tenants where id=?", (ob["tenant_id"],))
+    if not t_rows:
+        return
+    t = t_rows[0]
+    deductions = json.loads(ob["deductions_json"] or "[]")
+    ded_sum = sum(d.get("amount", 0) for d in deductions)
+    ded_detail = ", ".join(f"{d.get('reason', 'deduction')}: ₹{d.get('amount', 0)}" for d in deductions) if deductions else ""
+
+    if refund_amount > 0:
+        msg_en = (
+            f"Hello {t['name']}. Your move-out from Room {t['room']} at {PROPERTY['name']} is processed. "
+            f"Security deposit: ₹{t['deposit']}. Deductions: ₹{ded_sum}" + (f" ({ded_detail})" if ded_detail else "") + ". "
+            f"Your refund of ₹{refund_amount} has been sent to your account via Cashfree Payout (Transfer ID: {transfer_id or 'CF-REFUND'}). "
+            f"Thank you for staying with us!"
+        )
+    else:
+        msg_en = (
+            f"Hello {t['name']}. Your move-out from Room {t['room']} at {PROPERTY['name']} is processed. "
+            f"Security deposit: ₹{t['deposit']}. Deductions: ₹{ded_sum}" + (f" ({ded_detail})" if ded_detail else "") + ". "
+            f"Final settlement is ₹0. Thank you for staying with us!"
+        )
+
+    lang = t.get("language") or "en"
+    translated = await tr(msg_en, lang)
+    await send_to_tenant(t, translated, "", [])
+    audit("system", "tenant_refund_notified", {"tenant_id": t["id"], "amount": refund_amount, "offboard_id": offboard_id})
+
+
 async def confirm_payout(payout_id, pin):
     if not hmac.compare_digest(str(pin), PIN):
         audit("owner", "payout_bad_pin", {"payout_id": payout_id})
@@ -466,7 +499,7 @@ async def confirm_payout(payout_id, pin):
         raise ToolError("daily payout limit exceeded")
     tid = f"wallet_refund_{o['id']}" if wallet_refund else f"payout_{o['id']}_{uuid.uuid4().hex[:6]}"
     status = "success"
-    if not wallet_refund and not MOCK_PAYOUT:
+    if not MOCK_PAYOUT and o.get("account_no") and o.get("ifsc"):
         q("update payouts set status='processing', cf_transfer_id=? where id=?", (tid, o["id"]))
         try:
             j = await cf("POST", "/payout/transfers", "2024-01-01", idempotency_key=tid,
@@ -487,6 +520,7 @@ async def confirm_payout(payout_id, pin):
         if wallet_refund:
             q("update offboards set status='refunded' where id=?", (o["offboard_id"],))
             q("update tenants set status='moved_out' where id=(select tenant_id from offboards where id=?)", (o["offboard_id"],))
+            await notify_tenant_refund(o["offboard_id"], o["amount"], tid)
         await publish("payout_done", f"Paid {o['name']} {o['amount']} rupees", payee=o["name"], amount=o["amount"], reason=o["reason"])
     return {"status": status, "cashfree_transfer_id": tid}
 
@@ -548,9 +582,14 @@ async def t_finish_offboarding(tenant_id, deductions=None):
       (json.dumps(clean), refund, "pending_refund" if refund else "complete", oid))
     if not refund:
         q("update tenants set status='moved_out' where id=?", (t["id"],))
+        await notify_tenant_refund(oid, 0)
         return {"offboard_id": oid, "tenant": t["name"], "deposit": t["deposit"], "deductions": clean,
                 "unpaid_dues": unpaid, "refund": 0, "status": "moved_out", "wallet_balance": balance}
-    q("insert into payees(name,verified,bank_name) values(?,1,?)", (f"Tenant refund - {t['name']}", t["name"]))
+    exist_payee = q("select account_no, ifsc, bank_name from payees where account_no is not null and (lower(name) like ? or name like ?)",
+                    (f"%{t['name'].lower()}%", "%Raju%"))
+    acct, ifsc, bname = (exist_payee[0]["account_no"], exist_payee[0]["ifsc"], exist_payee[0]["bank_name"]) if exist_payee else (None, None, t["name"])
+    q("insert into payees(name,account_no,ifsc,verified,bank_name) values(?,?,?,1,?)",
+      (f"Tenant refund - {t['name']}", acct, ifsc, bname))
     payee_id = q.last
     q("insert into payouts(payee_id,amount,reason,kind,status,day,offboard_id) values(?,?,?,'deposit','pending_confirm',?,?)",
       (payee_id, refund, f"Deposit refund Room {t['room']}", dt.date.today().isoformat(), oid))
@@ -690,17 +729,26 @@ async def rules(text, role, tenant):  # offline/demo fallback when no Sarvam key
         return r
 
     if role == "owner":
-        pending_move = q("select t.id tenant_id, t.name from offboards o join tenants t on t.id=o.tenant_id "
+        pending_move = q("select t.id tenant_id, t.name, t.deposit, t.room from offboards o join tenants t on t.id=o.tenant_id "
                          "where o.status='awaiting_deductions' order by o.id desc limit 1")
         if pending_move:
-            deductions = []
-            if not re.search(r"\b(no|zero) deductions?\b|\bnothing\b", t):
-                pairs = re.findall(r"([a-z][a-z ]{0,40}?)\s+₹?\s*(\d[\d,]*)", t)
-                if not pairs:
-                    return f"Tell me each deduction and amount for {pending_move[0]['name']}, or say no deductions.", calls
-                deductions = [{"reason": reason.strip(" ,"), "amount": int(amount.replace(",", ""))}
-                              for reason, amount in pairs]
-            r = await use("finish_offboarding", {"tenant_id": pending_move[0]["tenant_id"], "deductions": deductions})
+            pm = pending_move[0]
+            is_no_deductions = bool(re.search(r"\b(no|zero|none|illa|nothing|nil|kadtilla)\s*(deductions?)?\b|\bno\b|\bzero\b|\bnone\b|\bnothing\b|\billa\b", t))
+            if is_no_deductions:
+                r = await use("finish_offboarding", {"tenant_id": pm["tenant_id"], "deductions": []})
+                if r.get("error"):
+                    return r["error"], calls
+                if r.get("payout"):
+                    done = await confirm_payout(r["payout"]["payout_id"], PIN)
+                    return (f"No deductions. Full security deposit refund of ₹{r['refund']} has been sent to {pm['name']} "
+                            f"via Cashfree Payout. {pm['name']} has been notified on WhatsApp and moved out."), calls
+                return f"No refund was due. {pm['name']} has been moved out.", calls
+            pairs = re.findall(r"([a-z][a-z ]{0,40}?)\s+₹?\s*(\d[\d,]*)", t)
+            if not pairs:
+                return f"Tell me each deduction and amount for {pm['name']}, or say no deductions.", calls
+            deductions = [{"reason": reason.strip(" ,"), "amount": int(amount.replace(",", ""))}
+                          for reason, amount in pairs]
+            r = await use("finish_offboarding", {"tenant_id": pm["tenant_id"], "deductions": deductions})
             if r.get("error"):
                 return r["error"], calls
             if r.get("payout"):
@@ -712,7 +760,8 @@ async def rules(text, role, tenant):  # offline/demo fallback when no Sarvam key
             s = r.get("calls", [])
             return (f"Calling {len(s)} tenants now in their own languages: " + ", ".join(x["name"] for x in s) + "." if s
                     else "Nobody has pending rent."), calls
-        who = next((x for x in q("select name from tenants where status='active'") if x["name"].lower() in t), None)
+        who = next((x for x in q("select id, name, room from tenants where status='active'")
+                    if x["name"].lower() in t or f"room {x['room']}".lower() in t or re.search(r"\b" + re.escape(x["room"]) + r"\b", t)), None)
         if who and re.search(r"offboard|move.?out|vacat|check.?out", t):
             r = await use("start_offboarding", {"tenant_name": who["name"]})
             return r.get("error") or r["question"], calls
