@@ -77,6 +77,8 @@ create table if not exists tickets(id integer primary key, tenant_id int, issue 
 create table if not exists audit_log(id integer primary key, ts text, actor text, action text, payload text);
 create unique index if not exists payments_txn_id_uq on payments(txn_id) where txn_id is not null;
 create unique index if not exists payouts_transfer_id_uq on payouts(cf_transfer_id) where cf_transfer_id is not null;
+create table if not exists subscriptions(id integer primary key, tenant_id int not null, subscription_id text unique, plan_id text, amount int, status text default 'initialized', auth_url text, created text default current_timestamp, activated_at text, last_charged_at text, last_error text, recovery_count int default 0);
+create unique index if not exists subscriptions_sub_id_uq on subscriptions(subscription_id) where subscription_id is not null;
 """
 
 
@@ -307,6 +309,103 @@ async def make_link(t, amount, mon, purpose=None):
     return {"link_id": link_id, "url": url, "amount": amount, "status": "created"}
 
 
+async def t_setup_autopay(tenant_id, notify=True):
+    t = tenant_row(int(tenant_id))
+    rent = int(t["rent"])
+    plan_id = f"rent_plan_{rent}"
+    sub_id = f"sub_{t['id']}_{secrets.token_hex(4)}"
+    if MOCK_CF:
+        auth_url = f"{PUBLIC_URL}/autopay/{sub_id}"
+    else:
+        # 1. Ensure Plan exists on Cashfree
+        try:
+            await cf("POST", "/pg/plans", "2023-08-01", json={
+                "plan_id": plan_id,
+                "plan_name": f"Monthly Rent {rent}",
+                "plan_type": "PERIODIC",
+                "plan_currency": "INR",
+                "plan_recurring_amount": rent,
+                "plan_max_amount": rent * 2,
+                "plan_intervals": 1,
+                "plan_period": "MONTH"
+            })
+        except Exception:
+            pass
+        # 2. Create Subscription Mandate
+        j = await cf("POST", "/pg/subscriptions", "2023-08-01", idempotency_key=sub_id, json={
+            "subscription_id": sub_id,
+            "plan_id": plan_id,
+            "customer_details": {
+                "customer_id": f"tenant_{t['id']}",
+                "customer_name": t["name"],
+                "customer_phone": t["phone"],
+                "customer_email": f"tenant{t['id']}@kirayamitra.in"
+            },
+            "authorization_details": {
+                "authorization_type": "UPI"
+            },
+            "subscription_meta": {
+                "notify_url": f"{PUBLIC_URL}/webhooks/cashfree/subscription"
+            }
+        })
+        auth_url = (
+            j.get("sub_session_url")
+            or (j.get("authorization_details") or {}).get("authorization_link")
+            or f"{CF_BASE}/subscription/auth/{sub_id}"
+        )
+    q("insert or replace into subscriptions(tenant_id,subscription_id,plan_id,amount,status,auth_url) values(?,?,?,?,?,?)",
+      (t["id"], sub_id, plan_id, rent, "bank_approval_pending", auth_url))
+    audit("system", "autopay_setup", {"tenant_id": t["id"], "subscription_id": sub_id, "amount": rent, "auth_url": auth_url})
+    if notify:
+        msg = await tr(f"Hello {t['name']}! Set up UPI AutoPay for your monthly rent (Rs {rent}) so your rent is paid automatically each month: {auth_url}", t["language"])
+        await send_to_tenant(t, msg, "", [])
+    return {"subscription_id": sub_id, "auth_url": auth_url, "amount": rent, "status": "bank_approval_pending"}
+
+
+async def t_confirm_autopay(subscription_id):
+    sub_rows = q("select * from subscriptions where subscription_id=?", (subscription_id,))
+    if not sub_rows:
+        raise ToolError(f"Subscription {subscription_id} not found")
+    sub = sub_rows[0]
+    t = tenant_row(sub["tenant_id"])
+    q("update subscriptions set status='active', activated_at=datetime('now','localtime') where subscription_id=?", (subscription_id,))
+    confirm_text = f"Congratulations {t['name']}! Your UPI AutoPay mandate for monthly rent (Rs {sub['amount']}) is now ACTIVE. Rent will be auto-debited each month."
+    translated = await tr(confirm_text, t["language"])
+    await send_to_tenant(t, translated, "", [])
+    owner_msg = f"{t['name']}, room {t['room']}, has activated UPI AutoPay for Rs {sub['amount']}/month."
+    await say(OWNER_PHONE, owner_msg, "kn", extra=f"Tenant: {t['name']}\nRoom: {t['room']}\nStatus: Active\nAmount: Rs {sub['amount']}")
+    await publish("autopay_activated", owner_msg, tenant_id=t["id"], room=t["room"], name=t["name"], amount=sub["amount"])
+    audit("cashfree", "autopay_activated", {"subscription_id": subscription_id, "tenant_id": t["id"]})
+    return {"ok": True, "status": "active"}
+
+
+async def t_trigger_relay_recovery(subscription_id, reason="insufficient_balance"):
+    sub_rows = q("select * from subscriptions where subscription_id=?", (subscription_id,))
+    if not sub_rows:
+        raise ToolError(f"Subscription {subscription_id} not found")
+    sub = sub_rows[0]
+    t = tenant_row(sub["tenant_id"])
+    new_count = (sub["recovery_count"] or 0) + 1
+    q("update subscriptions set status='recovery_in_progress', recovery_count=?, last_error=? where subscription_id=?",
+      (new_count, reason, subscription_id))
+    # Generate an instant payment link for the monthly rent
+    retry_link = await make_link(t, sub["amount"], month(), "Rent AutoPay Retry")
+    # Relay Agent message to tenant
+    recovery_text = (
+        f"Namaste {t['name']}. Your scheduled rent AutoPay of Rs {sub['amount']} could not be processed ({reason.replace('_', ' ')}). "
+        f"Cashfree Relay agent will retry. You can also complete your payment instantly here: {retry_link['url']}"
+    )
+    translated = await tr(recovery_text, t["language"])
+    await send_to_tenant(t, translated, "", [])
+    # Alert PG Owner
+    owner_text = f"AutoPay debit for {t['name']} (Room {t['room']}, Rs {sub['amount']}) failed: {reason}. Cashfree Relay agent is following up with recovery options."
+    await say(OWNER_PHONE, owner_text, "kn", extra=f"Tenant: {t['name']}\nRoom: {t['room']}\nReason: {reason}\nRetry link: {retry_link['url']}")
+    await publish("relay_recovery_triggered", owner_text, tenant_id=t["id"], room=t["room"], name=t["name"],
+                  amount=sub["amount"], reason=reason, retry_url=retry_link["url"])
+    audit("cashfree_relay", "recovery_triggered", {"subscription_id": subscription_id, "tenant_id": t["id"], "reason": reason, "recovery_count": new_count})
+    return {"ok": True, "recovery_count": new_count, "retry_url": retry_link["url"]}
+
+
 async def t_add_tenant(name, phone, room, rent=None, deposit=None, language="hi", due_day=5):
     language = LANGS.get(str(language).lower(), language)
     if language not in LC:
@@ -401,7 +500,8 @@ async def tenant_detail(tid):
             "promises": q("select amount,date,reason,ts from promises where tenant_id=? order by id desc", (tid,)),
             "tickets": q("select id,issue,status,ts from tickets where tenant_id=? order by id desc", (tid,)),
             "calls": q("select id,month,status,outcome,ts,transcript,reason,promise_date from calls where tenant_id=? order by id desc", (tid,)),
-            "profile": next(iter(q("select id,form_json,aadhaar_file is not null has_aadhaar,photo_file is not null has_photo from onboarding where tenant_id=?", (tid,))), None)}
+            "profile": next(iter(q("select id,form_json,aadhaar_file is not null has_aadhaar,photo_file is not null has_photo from onboarding where tenant_id=?", (tid,))), None),
+            "subscription": next(iter(q("select * from subscriptions where tenant_id=? order by id desc", (tid,))), None)}
 
 
 async def t_tenant_info(tenant_id):
@@ -605,6 +705,8 @@ TOOLS = {
                                 "required": ["reason", "amount"]}}}, "required": ["tenant_id", "deductions"]}, {"owner"}),
     "monthly_summary": (t_monthly_summary, "This month's collected, pending, repairs, vacant beds, deposits held.", P(), {"owner"}),
     "verify_payee": (t_verify_payee, "Verify and save a payee's bank account.", P(name="string", account_no="string", ifsc="string"), {"owner"}),
+    "setup_autopay": (t_setup_autopay, "Set up Cashfree UPI AutoPay (recurring mandate) for a tenant's monthly rent.",
+                      P(tenant_id="integer"), {"owner"}),
 }
 
 
@@ -730,6 +832,12 @@ async def rules(text, role, tenant):  # offline/demo fallback when no Sarvam key
             wallet = f"₹{s['wallet_balance']:g}" if s["wallet_balance"] is not None else "unavailable"
             return (f"Collected ₹{s['collected']}, pending ₹{s['pending']}, repairs ₹{s['repairs_spent']}, "
                     f"{s['beds_vacant']} beds vacant, deposits held ₹{s['deposits_held']}, Cashfree wallet {wallet}."), calls
+        m = re.search(r"autopay|mandate|subscription", t)
+        if m:
+            for tn in q("select id, name, room from tenants where status='active'"):
+                if tn["name"].lower() in t or tn["room"].lower() in t:
+                    r = await use("setup_autopay", {"tenant_id": tn["id"]})
+                    return (r.get("error") or f"UPI AutoPay mandate link created and sent to {tn['name']} (Room {tn['room']})."), calls
         m = re.search(r"onboard (\w[\w ]*?) (\d{10}) room (\w+)", t)
         if m:
             r = await use("start_onboarding", {"name": m.group(1).title(), "phone": m.group(2), "room": m.group(3)})
@@ -1324,7 +1432,8 @@ async def send_receipts(p, delta, left, txn, receipt_no):
 async def lifespan(_):
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
-    for migration in ("alter table tenants add column whatsapp text", "alter table payouts add column offboard_id int"):
+    for migration in ("alter table tenants add column whatsapp text", "alter table payouts add column offboard_id int",
+                      "create table if not exists subscriptions(id integer primary key, tenant_id int not null, subscription_id text unique, plan_id text, amount int, status text default 'initialized', auth_url text, created text default current_timestamp, activated_at text, last_charged_at text, last_error text, recovery_count int default 0)"):
         try:
             c.execute(migration)
             c.commit()
@@ -1498,6 +1607,152 @@ async def webhook_payout(request: Request):
         await publish("payout_done", f"Paid {old['name']} {old['amount']} rupees",
                       payee=old["name"], amount=old["amount"], reason=old["reason"])
     return {"ok": True, "status": new}
+
+
+@app.post("/webhooks/cashfree/subscription")
+async def webhook_subscription(request: Request, bg: BackgroundTasks):
+    raw = await request.body()
+    if not MOCK_CF:
+        verify_cashfree_webhook(request, raw, CF_SECRET)
+    try:
+        body = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid JSON")
+    event_type = str(body.get("type") or body.get("event") or body.get("event_type") or "").upper()
+    data = body.get("data") or {}
+    subscription = data.get("subscription") or data
+    sub_id = subscription.get("subscription_id")
+    if not sub_id:
+        return {"ok": True, "ignored": True}
+
+    # Mandate Activated (Tenant authenticated in UPI app)
+    if ("ACTIVE" in event_type or str(subscription.get("status") or "").upper() == "ACTIVE") and "DECLINED" not in event_type and "FAILED" not in event_type:
+        await t_confirm_autopay(sub_id)
+        return {"ok": True, "status": "active"}
+
+    # Recurring Debit Charged Successfully
+    if any(k in event_type for k in ("CHARGED", "PAYMENT_SUCCESS", "SUCCESS")):
+        payment = data.get("payment") or {}
+        sub_row = q("select tenant_id, amount from subscriptions where subscription_id=?", (sub_id,))
+        if sub_row:
+            tid = sub_row[0]["tenant_id"]
+            amount = payment.get("payment_amount") or subscription.get("subscription_amount") or sub_row[0]["amount"]
+            txn = payment.get("cf_payment_id") or f"SUB-{sub_id}-{uuid.uuid4().hex[:8].upper()}"
+            link_id = f"subcharge_{sub_id}_{month()}_{uuid.uuid4().hex[:6]}"
+            q("insert or ignore into payments(tenant_id,link_id,amount,month,url,method) values(?,?,?,?,?,'autopay')",
+              (tid, link_id, amount, month(), ""))
+            q("update subscriptions set last_charged_at=datetime('now','localtime'), status='active' where subscription_id=?", (sub_id,))
+            return await apply_payment(link_id, amount, txn, bg)
+
+    # Debit Failed / Declined -> Trigger Cashfree Relay Agent Recovery
+    if any(k in event_type for k in ("DECLINED", "FAILED", "ON_HOLD")):
+        reason = (data.get("payment") or {}).get("payment_message") or data.get("failure_reason") or "insufficient_balance"
+        return await t_trigger_relay_recovery(sub_id, str(reason))
+
+    # Cashfree Relay Agent recovery updates
+    if "RELAY" in event_type:
+        audit("cashfree_relay", "webhook_event", {"event": event_type, "data": data})
+        return {"ok": True, "relay": True}
+
+    return {"ok": True, "event": event_type}
+
+
+@app.get("/tenants/{tid}/autopay")
+def tenant_autopay_get(tid: int):
+    t = tenant_row(tid)
+    sub = next(iter(q("select * from subscriptions where tenant_id=? order by id desc", (tid,))), None)
+    return {"tenant_id": tid, "tenant_name": t["name"], "room": t["room"], "subscription": sub}
+
+
+@app.post("/tenants/{tid}/autopay")
+async def tenant_autopay_setup(tid: int):
+    return await t_setup_autopay(tid, notify=True)
+
+
+@app.post("/tenants/{tid}/autopay/simulate-activate")
+async def tenant_autopay_sim_activate(tid: int):
+    sub = next(iter(q("select * from subscriptions where tenant_id=? order by id desc", (tid,))), None)
+    if not sub:
+        sub = await t_setup_autopay(tid, notify=False)
+    return await t_confirm_autopay(sub["subscription_id"])
+
+
+@app.post("/tenants/{tid}/autopay/simulate-charge")
+async def tenant_autopay_sim_charge(tid: int, bg: BackgroundTasks):
+    sub = next(iter(q("select * from subscriptions where tenant_id=? order by id desc", (tid,))), None)
+    if not sub:
+        raise HTTPException(400, "no subscription found")
+    link_id = f"subcharge_{sub['subscription_id']}_{month()}_{uuid.uuid4().hex[:6]}"
+    q("insert or ignore into payments(tenant_id,link_id,amount,month,url,method) values(?,?,?,?,?,'autopay')",
+      (tid, link_id, sub["amount"], month(), ""))
+    q("update subscriptions set last_charged_at=datetime('now','localtime'), status='active' where subscription_id=?", (sub["subscription_id"],))
+    return await apply_payment(link_id, sub["amount"], f"SUB-MOCK-{uuid.uuid4().hex[:8].upper()}", bg)
+
+
+@app.post("/tenants/{tid}/autopay/simulate-failure")
+async def tenant_autopay_sim_failure(tid: int):
+    sub = next(iter(q("select * from subscriptions where tenant_id=? order by id desc", (tid,))), None)
+    if not sub:
+        sub = await t_setup_autopay(tid, notify=False)
+    return await t_trigger_relay_recovery(sub["subscription_id"], "insufficient_balance")
+
+
+@app.post("/dev/simulate-autopay/{sub_id}")
+async def dev_simulate_autopay(sub_id: str, request: Request):
+    b = await request.json() if await request.body() else {}
+    action = b.get("action", "activate")
+    if action == "fail":
+        return await t_trigger_relay_recovery(sub_id, b.get("reason", "insufficient_balance"))
+    return await t_confirm_autopay(sub_id)
+
+
+@app.get("/autopay/{sub_id}", response_class=HTMLResponse)
+def autopay_page(sub_id: str):
+    sub_rows = q("select s.*, t.name, t.room from subscriptions s join tenants t on t.id=s.tenant_id where s.subscription_id=?", (sub_id,))
+    if not sub_rows:
+        raise HTTPException(404, "unknown subscription")
+    s = sub_rows[0]
+    return f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>Cashfree AutoPay</title>
+<body style="font-family:system-ui,-apple-system,sans-serif;max-width:440px;margin:30px auto;padding:0 20px;background:#f8fafc;color:#0f172a">
+<div style="background:#fff;border-radius:16px;padding:24px;border:1px solid #e2e8f0;box-shadow:0 4px 6px -1px rgba(0,0,0,0.05)">
+  <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #e2e8f0;padding-bottom:16px;margin-bottom:20px">
+    <div>
+      <h3 style="margin:0;font-size:18px;font-weight:700">{PROPERTY['name']}</h3>
+      <p style="margin:2px 0 0;font-size:13px;color:#64748b">UPI AutoPay via Cashfree</p>
+    </div>
+    <span style="background:#e0f2fe;color:#0369a1;font-size:12px;font-weight:600;padding:4px 8px;border-radius:8px">Recurring</span>
+  </div>
+  <div style="margin-bottom:20px">
+    <p style="margin:0;font-size:13px;color:#64748b">Tenant</p>
+    <p style="margin:2px 0 12px;font-size:16px;font-weight:600">{s['name']} · Room {s['room']}</p>
+    <p style="margin:0;font-size:13px;color:#64748b">Monthly Debit Amount</p>
+    <p style="margin:2px 0 0;font-size:28px;font-weight:800;color:#0f172a">₹{s['amount']}<span style="font-size:14px;font-weight:500;color:#64748b"> / month</span></p>
+    <p style="margin:4px 0 0;font-size:12px;color:#64748b">Frequency: 5th of every month</p>
+  </div>
+  <div style="background:#f1f5f9;border-radius:10px;padding:12px;margin-bottom:20px;font-size:12px;color:#475569">
+    <div style="font-weight:600;margin-bottom:4px">Supported Apps:</div>
+    <div>Google Pay · PhonePe · Paytm · BHIM UPI</div>
+    <div style="margin-top:6px;font-size:11px;color:#64748b">Protected by Cashfree Relay Autonomous Recovery</div>
+  </div>
+  <button id=btn-auth style="width:100%;padding:14px;background:#2563eb;color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;margin-bottom:10px">Authorize UPI AutoPay</button>
+  <button id=btn-fail style="width:100%;padding:10px;background:#fee2e2;color:#b91c1c;border:none;border-radius:12px;font-size:13px;font-weight:500;cursor:pointer">Simulate Debit Failure (Test Relay Recovery)</button>
+  <p id=msg style="margin-top:16px;text-align:center;font-size:14px;font-weight:500"></p>
+</div>
+<script>
+const b1=document.getElementById('btn-auth'), b2=document.getElementById('btn-fail'), msg=document.getElementById('msg');
+b1.onclick=async()=>{{
+  b1.disabled=b2.disabled=true;
+  const r=await fetch('/dev/simulate-autopay/{sub_id}',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{action:'activate'}})}});
+  msg.style.color=r.ok?'#16a34a':'#dc2626';
+  msg.textContent=r.ok?'Mandate Authorized! AutoPay is now ACTIVE. You can close this tab.':'Authorization failed.';
+}};
+b2.onclick=async()=>{{
+  b1.disabled=b2.disabled=true;
+  const r=await fetch('/dev/simulate-autopay/{sub_id}',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{action:'fail',reason:'insufficient_balance'}})}});
+  msg.style.color=r.ok?'#d97706':'#dc2626';
+  msg.textContent=r.ok?'Debit failed! Cashfree Relay agent triggered for automated WhatsApp recovery.':'Simulation failed.';
+}};
+</script></body>"""
 
 
 @app.post("/dev/simulate-payment/{link_id}")
@@ -1957,7 +2212,8 @@ async def onboarding_approve(oid: int):
     audit("owner", "onboarding_approved", {"id": oid, "tenant_id": res["tenant_id"]})
     t = tenant_row(res["tenant_id"])
     await send_to_tenant(t, res["welcome_text"], "", [])
-    return {"tenant_id": res["tenant_id"]}
+    ap = await t_setup_autopay(res["tenant_id"], notify=True)
+    return {"tenant_id": res["tenant_id"], "autopay": ap}
 
 
 @app.post("/webhooks/sarvam/onboarding")

@@ -35,5 +35,9 @@ Owner chips: "Yaaru innu kottilla?" -> "Ellarigu reminder kalsi" -> tenant (Anki
 ## Safety (enforced in backend)
 Payouts only to verified saved payees; LLM can only *prepare* a payout, money moves only via `/payouts/confirm` with PIN; daily limit; tenants can only act on their own id; audit_log table records every tool call.
 
+## Cashfree Relay & UPI AutoPay
+- **UPI AutoPay (Cashfree Subscriptions)**: Automatically enrolled on onboarding approval or via the dashboard/voice agent. Tenants authorize a recurring monthly mandate via GPay, PhonePe, or Paytm.
+- **Cashfree Relay AI Super Agent**: Autonomously monitors recurring rent debits. When an auto-debit fails or is declined, Relay executes conversational WhatsApp dunning with an instant retry link and alerts the owner. See [CASHFREE_RELAY_AGENT.md](file:///d:/pgrm/nele-cashfree/CASHFREE_RELAY_AGENT.md).
+
 ## Not built
-UPI AutoPay (Cashfree Subscriptions), Sarvam Vision ID scan, dashboard login/auth, tenant move-out UI. Voice replies from tenants on calls (keypad only for now).
+Sarvam Vision ID scan, dashboard login/auth, tenant move-out UI. Voice replies from tenants on calls (keypad only for now).

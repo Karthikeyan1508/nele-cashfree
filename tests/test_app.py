@@ -444,3 +444,46 @@ def test_onboarding_needs_owner_confirmation(c):
     c.post("/whatsapp/simulate", data={"text": "yes"})  # nothing pending: handled as a normal message, no call
     assert not A.q("select 1 from onboarding where phone='9876500078' and status='link_sent'")
     assert not A.q("select 1 from onboarding where status='pending_confirm' and phone in ('9876500077','9876500078')")
+
+
+def test_autopay_setup_and_activation(c):
+    t = tid(c, "Karthikeyan")
+    r = c.post(f"/tenants/{t}/autopay")
+    assert r.status_code == 200
+    sub_id = r.json()["subscription_id"]
+    assert r.json()["status"] == "bank_approval_pending"
+    assert "/autopay/" in r.json()["auth_url"]
+
+    # Check tenant detail includes subscription
+    td = c.get(f"/tenants/{t}").json()
+    assert td["subscription"] is not None
+    assert td["subscription"]["subscription_id"] == sub_id
+
+    # Simulate authorization
+    act = c.post(f"/tenants/{t}/autopay/simulate-activate")
+    assert act.status_code == 200
+    assert act.json()["status"] == "active"
+
+    td = c.get(f"/tenants/{t}").json()
+    assert td["subscription"]["status"] == "active"
+
+
+def test_cashfree_relay_recovery_on_failed_autopay(c):
+    t = tid(c, "Dhananjayadas")
+    r = c.post(f"/tenants/{t}/autopay")
+    sub_id = r.json()["subscription_id"]
+
+    # Trigger failed debit / decline
+    fail_res = c.post(f"/tenants/{t}/autopay/simulate-failure")
+    assert fail_res.status_code == 200
+    assert fail_res.json()["ok"] is True
+    assert "retry_url" in fail_res.json()
+
+    td = c.get(f"/tenants/{t}").json()
+    assert td["subscription"]["status"] == "recovery_in_progress"
+    assert td["subscription"]["last_error"] == "insufficient_balance"
+    assert td["subscription"]["recovery_count"] >= 1
+
+    # Check that tenant got WhatsApp message from Relay agent with retry link
+    msgs = A.q("select * from messages where role='tenant' and phone='9000000002' order by id desc limit 5")
+    assert any("Cashfree Relay" in m["text"] or "retry" in m["text"].lower() for m in msgs)

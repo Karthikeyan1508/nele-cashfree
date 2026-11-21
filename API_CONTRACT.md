@@ -22,6 +22,7 @@ Every call may carry header `X-Owner-Id` (hardcode `1` for the demo; no auth).
 | pay_vendor — step 2 | `POST /payouts/confirm` | `{payout_id, pin}` | `{status:"processing"\|"success"\|"failed", cashfree_transfer_id}` |
 | settle_deposit (stretch) | `POST /deposits/settle` | `{tenant_id, deductions:[{reason, amount}]}` | `{deposit, deductions_total, dues, refund, payout_id}` |
 | offboard tenant | agent tools `start_offboarding` → `finish_offboarding` | tenant + deductions | Refund requiring payout PIN; affordability uses the live Cashfree Payouts available balance |
+| setup_autopay | `POST /tenants/{id}/autopay` | `{tenant_id}` | `{subscription_id, auth_url, amount, status:"bank_approval_pending"}` |
 | monthly_summary | `GET /summary?month=2026-11` | — | `{collected, pending, repairs_spent, beds_vacant, deposits_held, wallet_balance, wallet_status}` |
 
 Rules enforced **in backend, not the LLM**:
@@ -36,6 +37,7 @@ Rules enforced **in backend, not the LLM**:
 |---|---|
 | `POST /webhooks/cashfree/payment` | Payment-link paid/partial. Verify signature (`x-webhook-signature` + `x-webhook-timestamp`), update `ledger`, then emit event below. Idempotent on `link_id`/`cf_payment_id`. |
 | `POST /webhooks/cashfree/payout` | Transfer status → update `payouts`. |
+| `POST /webhooks/cashfree/subscription` | Recurring UPI AutoPay mandate status (`SUBSCRIPTION_ACTIVE`), recurring debits (`SUBSCRIPTION_CHARGED`), and decline/dunning triggers (`SUBSCRIPTION_PAYMENT_DECLINED`) managed by Cashfree Relay Agent. |
 
 Expose via ngrok; register URL in Cashfree sandbox dashboard.
 

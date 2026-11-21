@@ -112,8 +112,13 @@ function Review({ id, onClose, onChange }: { id: number | null; onClose: () => v
                   </div>
                 </>
               ) : <p className="text-muted-foreground">The form has not been submitted yet. Link: <span className="break-all">{d.link}</span></p>}
+              {d.status === "submitted" && (
+                <div className="rounded-lg border border-blue-200 bg-blue-50/80 p-3 text-xs text-blue-900 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300">
+                  On approval, the tenant is enrolled in <strong>Cashfree Relay AutoPay</strong> for monthly rent of {inr(d.rent)}. A UPI AutoPay authorization link will be sent to their WhatsApp.
+                </div>
+              )}
               <div className="flex flex-wrap gap-2 pt-2">
-                {d.status === "submitted" && <Button onClick={() => act("approve", `${d.name} added as a tenant`)}><Check /> Approve and add tenant</Button>}
+                {d.status === "submitted" && <Button onClick={() => act("approve", `${d.name} added as a tenant with Cashfree AutoPay`)}><Check /> Approve & Setup AutoPay</Button>}
                 {["invited", "link_sent", "submitted"].includes(d.status) && <Button variant="outline" onClick={() => act("reject", "Rejected")}><X /> Reject</Button>}
                 {["invited", "link_sent"].includes(d.status) && <Button variant="outline" onClick={() => act("resend", "Form link sent again")}><RefreshCw /> Resend link</Button>}
                 <Button variant="ghost" onClick={() => { navigator.clipboard.writeText(d.link); toast.success("Link copied") }}><Copy /> Copy link</Button>
