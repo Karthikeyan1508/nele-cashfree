@@ -18,8 +18,14 @@ if (ROOT / ".env").exists():  # tiny .env loader, no dependency
 
 SK = os.getenv("SARVAM_API_KEY", "")
 CF_ID, CF_SECRET = os.getenv("CASHFREE_CLIENT_ID", ""), os.getenv("CASHFREE_CLIENT_SECRET", "")
+CF_PAYOUT_ID = os.getenv("CASHFREE_PAYOUT_CLIENT_ID") or CF_ID
+CF_PAYOUT_SECRET = os.getenv("CASHFREE_PAYOUT_CLIENT_SECRET") or CF_SECRET
+CF_VERIFY_ID = os.getenv("CASHFREE_VERIFY_CLIENT_ID") or CF_ID
+CF_VERIFY_SECRET = os.getenv("CASHFREE_VERIFY_CLIENT_SECRET") or CF_SECRET
 CF_BASE = os.getenv("CASHFREE_BASE", "https://sandbox.cashfree.com")
 MOCK_CF = not (CF_ID and CF_SECRET)
+MOCK_PAYOUT = not (CF_PAYOUT_ID and CF_PAYOUT_SECRET)
+MOCK_VERIFY = not (CF_VERIFY_ID and CF_VERIFY_SECRET)
 PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8000")
 PIN = os.getenv("PAYOUT_PIN", "1234")
 DAILY_LIMIT = int(os.getenv("DAILY_PAYOUT_LIMIT", "5000"))
@@ -67,6 +73,8 @@ create table if not exists payees(id integer primary key, name text, account_no 
 create table if not exists payouts(id integer primary key, payee_id int, amount int, reason text, kind text default 'vendor', status text, cf_transfer_id text, day text);
 create table if not exists tickets(id integer primary key, tenant_id int, issue text, status text default 'open', ts text default current_timestamp);
 create table if not exists audit_log(id integer primary key, ts text, actor text, action text, payload text);
+create unique index if not exists payments_txn_id_uq on payments(txn_id) where txn_id is not null;
+create unique index if not exists payouts_transfer_id_uq on payouts(cf_transfer_id) where cf_transfer_id is not null;
 """
 
 
@@ -192,10 +200,13 @@ async def stt(data: bytes, name="a.webm", ctype="audio/webm"):
 
 
 # ---------- cashfree ----------
-async def cf(method, path, ver, **kw):
+async def cf(method, path, ver, idempotency_key=None, credentials=None, **kw):
+    client_id, client_secret = credentials or (CF_ID, CF_SECRET)
+    headers = {"x-client-id": client_id, "x-client-secret": client_secret, "x-api-version": ver}
+    if idempotency_key:
+        headers["x-idempotency-key"] = idempotency_key
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.request(method, CF_BASE + path, headers={"x-client-id": CF_ID, "x-client-secret": CF_SECRET,
-                                                             "x-api-version": ver}, **kw)
+        r = await c.request(method, CF_BASE + path, headers=headers, **kw)
         if r.status_code >= 400:
             raise ToolError(f"Cashfree {r.status_code}: {r.text[:200]}")
         return r.json()
@@ -238,7 +249,7 @@ async def make_link(t, amount, mon, purpose=None):
     if MOCK_CF:
         url = f"{PUBLIC_URL}/pay/{link_id}"
     else:
-        j = await cf("POST", "/pg/links", "2025-01-01", json={
+        j = await cf("POST", "/pg/links", "2025-01-01", idempotency_key=link_id, json={
             "link_id": link_id, "link_amount": amount, "link_currency": "INR",
             "link_purpose": purpose or f"Rent {mon} Room {t['room']}",
             "customer_details": {"customer_name": t["name"], "customer_phone": t["phone"]},
@@ -351,12 +362,13 @@ async def t_tenant_info(tenant_id):
 
 
 async def t_verify_payee(name, account_no=None, ifsc=None):
-    if MOCK_CF:
+    if MOCK_VERIFY:
         ok, bank_name = True, name
     else:
         if not (account_no and ifsc):
             raise ToolError("account_no and ifsc required")
         j = await cf("POST", "/verification/bank-account/sync", "2023-12-18",
+                     credentials=(CF_VERIFY_ID, CF_VERIFY_SECRET),
                      json={"bank_account": account_no, "ifsc": ifsc, "name": name})
         ok, bank_name = j.get("account_status") == "VALID", j.get("name_at_bank")
     q("insert into payees(name,account_no,ifsc,verified,bank_name) values(?,?,?,?,?)",
@@ -400,21 +412,24 @@ async def confirm_payout(payout_id, pin):
         raise ToolError("daily payout limit exceeded")
     tid = f"payout_{o['id']}_{uuid.uuid4().hex[:6]}"
     status = "success"
-    if not MOCK_CF:
+    if not MOCK_PAYOUT:
+        q("update payouts set status='processing', cf_transfer_id=? where id=?", (tid, o["id"]))
         try:
-            j = await cf("POST", "/payout/transfers", "2024-01-01", json={
+            j = await cf("POST", "/payout/transfers", "2024-01-01", idempotency_key=tid,
+                         credentials=(CF_PAYOUT_ID, CF_PAYOUT_SECRET), json={
                 "transfer_id": tid, "transfer_amount": o["amount"], "transfer_currency": "INR", "transfer_mode": "imps",
                 "beneficiary_details": {"beneficiary_id": f"payee_{o['payee_id']}", "beneficiary_name": o["name"],
                                         "beneficiary_instrument_details": {"bank_account_number": o["account_no"],
                                                                            "bank_ifsc": o["ifsc"]}}})
-            status = "success" if str(j.get("status", "")).upper() == "SUCCESS" else "processing"
+            status = ("success" if str(j.get("status", "")).upper() == "SUCCESS" and
+                      str(j.get("status_code", "")).upper() == "COMPLETED" else "processing")
         except ToolError as e:
-            q("update payouts set status='failed', cf_transfer_id=? where id=?", (tid, o["id"]))
-            audit("owner", "payout_failed", {"payout_id": o["id"], "err": str(e)})
-            raise
+            audit("owner", "payout_status_unknown", {"payout_id": o["id"], "transfer_id": tid, "err": str(e)})
+            raise ToolError(f"payout submitted but status is unknown; reconcile transfer {tid}")
     q("update payouts set status=?, cf_transfer_id=? where id=?", (status, tid, o["id"]))
     audit("owner", "payout_confirmed", {"payout_id": o["id"], "amount": o["amount"], "to": o["name"], "status": status})
-    await publish("payout_done", f"Paid {o['name']} {o['amount']} rupees", payee=o["name"], amount=o["amount"], reason=o["reason"])
+    if status == "success":
+        await publish("payout_done", f"Paid {o['name']} {o['amount']} rupees", payee=o["name"], amount=o["amount"], reason=o["reason"])
     return {"status": status, "cashfree_transfer_id": tid}
 
 
@@ -763,9 +778,10 @@ async def handle_incoming(frm, kind, text=None, media=None, wa_id=None, deliver=
             except ToolError as e:
                 return await say(phone, str(e), "kn", role, deliver)
     r = await respond(role, tenant, transcript, WA_CODEC if (WA_TOKEN and deliver) else "wav")
-    log_msg(phone, role, "out", "audio" if r["reply_audio_url"] else "text", r["reply_text"], r["reply_audio_url"])
+    reply = r["reply_text"] + ("\n" + "\n".join(r["links"]) if r["links"] else "")
+    log_msg(phone, role, "out", "audio" if r["reply_audio_url"] else "text", reply, r["reply_audio_url"])
     if deliver:
-        await wa_send(phone, r["reply_text"], r["reply_audio_url"])
+        await wa_send(phone, reply, r["reply_audio_url"])
     if r["pending_payout"]:
         await say(phone, f"{r['pending_payout']['readback']}. To send, type: CONFIRM and your PIN.", "kn" if role == "owner" else "en", role, deliver)
 
@@ -1102,30 +1118,50 @@ def ob_live(token):
 
 
 # ---------- payments ----------
-async def apply_payment(link_id, total_paid, txn=None):
-    r = q("select p.*, t.name, t.room from payments p join tenants t on t.id=p.tenant_id where link_id=?", (link_id,))
-    if not r:
-        raise HTTPException(404, "unknown link")
-    p = r[0]
-    total_paid = min(int(total_paid), p["amount"])
-    delta = total_paid - p["paid"]
-    if delta <= 0:
-        return {"ok": True, "duplicate": True}  # idempotent
-    receipt_no = f"KM-{p['month'].replace('-', '')}-{p['id']:04d}"
-    txn = txn or f"LINK-{link_id}"
-    q("update payments set paid=?, status=?, paid_ts=datetime('now','localtime'), txn_id=?, receipt_no=? where link_id=?",
-      (total_paid, "paid" if total_paid >= p["amount"] else "partial", txn, receipt_no, link_id))
-    q("update ledger set paid=paid+?, status=case when paid+?>=due then 'paid' else 'partial' end where tenant_id=? and month=?",
-      (delta, delta, p["tenant_id"], p["month"]))
-    left = max(q("select due-paid x from ledger where tenant_id=? and month=?", (p["tenant_id"], p["month"]))[0]["x"], 0)
-    if left <= 0:
-        q("update ledger set promise_date=null where tenant_id=? and month=?", (p["tenant_id"], p["month"]))
-    audit("cashfree", "payment_received", {"link_id": link_id, "delta": delta, "txn": txn, "receipt": receipt_no})
+async def apply_payment(link_id, total_paid, txn=None, background_tasks=None):
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    try:
+        c.execute("begin immediate")
+        row = c.execute("select p.*, t.name, t.room from payments p join tenants t on t.id=p.tenant_id where link_id=?",
+                        (link_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "unknown link")
+        p = dict(row)
+        txn = txn or f"LINK-{link_id}"
+        if c.execute("select 1 from payments where txn_id=?", (txn,)).fetchone():
+            c.commit()
+            return {"ok": True, "duplicate": True}
+        total_paid = min(int(total_paid), p["amount"])
+        delta = total_paid - p["paid"]
+        if delta <= 0:
+            c.commit()
+            return {"ok": True, "duplicate": True}
+        receipt_no = f"KM-{p['month'].replace('-', '')}-{p['id']:04d}"
+        c.execute("update payments set paid=?, status=?, paid_ts=datetime('now','localtime'), txn_id=?, receipt_no=? where link_id=?",
+                  (total_paid, "paid" if total_paid >= p["amount"] else "partial", txn, receipt_no, link_id))
+        c.execute("update ledger set paid=paid+?, status=case when paid+?>=due then 'paid' else 'partial' end where tenant_id=? and month=?",
+                  (delta, delta, p["tenant_id"], p["month"]))
+        left = max(c.execute("select due-paid from ledger where tenant_id=? and month=?",
+                             (p["tenant_id"], p["month"])).fetchone()[0], 0)
+        if left <= 0:
+            c.execute("update ledger set promise_date=null where tenant_id=? and month=?", (p["tenant_id"], p["month"]))
+        c.commit()
+    finally:
+        c.close()
+    if background_tasks is not None:
+        background_tasks.add_task(payment_notifications, p, delta, left, txn, receipt_no)
+    else:
+        await payment_notifications(p, delta, left, txn, receipt_no)
+    return {"ok": True, "pending": left, "receipt_no": receipt_no}
+
+
+async def payment_notifications(p, delta, left, txn, receipt_no):
+    audit("cashfree", "payment_received", {"link_id": p["link_id"], "delta": delta, "txn": txn, "receipt": receipt_no})
     await publish("payment_received", f"Room {p['room']}, {p['name']}, payment of {delta} rupees received.",
                   f"ಕೊಠಡಿ {p['room']}, {p['name']}, ₹{delta} ಬಂದಿದೆ", tenant_id=p["tenant_id"], room=p["room"], name=p["name"],
                   amount=delta, pending=left)
     await send_receipts(p, delta, left, txn, receipt_no)
-    return {"ok": True, "pending": left, "receipt_no": receipt_no}
 
 
 async def send_receipts(p, delta, left, txn, receipt_no):
@@ -1233,20 +1269,81 @@ async def tts_ep(request: Request):
     return {"audio_url": await tts(b["text"], b.get("lang", "kn"))}
 
 
+def verify_cashfree_webhook(request, raw, secret):
+    if not secret:
+        raise HTTPException(503, "Cashfree webhook disabled in mock mode")
+    ts = request.headers.get("x-webhook-timestamp", "")
+    sig = request.headers.get("x-webhook-signature", "")
+    try:
+        sent = float(ts)
+        sent = sent / 1000 if sent > 10**12 else sent
+    except ValueError:
+        raise HTTPException(401, "bad webhook timestamp")
+    if abs(dt.datetime.now(dt.timezone.utc).timestamp() - sent) > 300:
+        raise HTTPException(401, "stale webhook")
+    exp = base64.b64encode(hmac.new(secret.encode(), ts.encode() + raw, hashlib.sha256).digest()).decode()
+    if not hmac.compare_digest(sig, exp):
+        raise HTTPException(401, "bad signature")
+
+
 @app.post("/webhooks/cashfree/payment")
-async def webhook_payment(request: Request):
+async def webhook_payment(request: Request, background_tasks: BackgroundTasks):
     raw = await request.body()
-    if CF_SECRET:
-        ts, sig = request.headers.get("x-webhook-timestamp", ""), request.headers.get("x-webhook-signature", "")
-        exp = base64.b64encode(hmac.new(CF_SECRET.encode(), ts.encode() + raw, hashlib.sha256).digest()).decode()
-        if not hmac.compare_digest(sig, exp):
-            raise HTTPException(401, "bad signature")
-    d = json.loads(raw).get("data", {})
+    verify_cashfree_webhook(request, raw, CF_SECRET)
+    try:
+        d = json.loads(raw).get("data", {})
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid JSON")
     link_id = d.get("link_id")
     if not link_id:
         return {"ok": True, "ignored": True}
-    return await apply_payment(link_id, d.get("link_amount_paid", d.get("link_amount", 0)),
-                               d.get("cf_payment_id") or (d.get("order") or {}).get("transaction_id"))
+    payment = d.get("payment") or {}
+    status = str(d.get("link_status") or d.get("payment_status") or payment.get("payment_status") or "").upper()
+    if status not in ("PAID", "PARTIALLY_PAID", "SUCCESS"):
+        return {"ok": True, "ignored": True}
+    if d.get("link_currency") and d["link_currency"] != "INR":
+        raise HTTPException(400, "unexpected currency")
+    paid = d.get("link_amount_paid", d.get("link_amount", payment.get("payment_amount", 0)))
+    if float(paid or 0) <= 0:
+        raise HTTPException(400, "invalid paid amount")
+    txn = d.get("cf_payment_id") or payment.get("cf_payment_id") or (d.get("order") or {}).get("transaction_id")
+    return await apply_payment(link_id, paid, txn, background_tasks)
+
+
+@app.post("/webhooks/cashfree/payout")
+async def webhook_payout(request: Request):
+    raw = await request.body()
+    verify_cashfree_webhook(request, raw, CF_PAYOUT_SECRET)
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid JSON")
+    data = body.get("data") or {}
+    transfer = data.get("transfer") or data
+    transfer_id = transfer.get("transfer_id")
+    if not transfer_id:
+        return {"ok": True, "ignored": True}
+    rows = q("select o.*, p.name from payouts o join payees p on p.id=o.payee_id where o.cf_transfer_id=?", (transfer_id,))
+    if not rows:
+        raise HTTPException(404, "unknown transfer")
+    old = rows[0]
+    event = str(body.get("type") or body.get("event_type") or "").upper()
+    status = str(transfer.get("status") or "").upper()
+    code = str(transfer.get("status_code") or "").upper()
+    if status == "SUCCESS" and code == "COMPLETED":
+        new = "success"
+    elif "REVERSE" in event or status == "REVERSED":
+        new = "reversed"
+    elif "FAIL" in event or status == "FAILED":
+        new = "failed"
+    else:
+        new = "processing"
+    q("update payouts set status=? where id=?", (new, old["id"]))
+    audit("cashfree", "payout_status", {"payout_id": old["id"], "transfer_id": transfer_id, "status": new})
+    if new == "success" and old["status"] != "success":
+        await publish("payout_done", f"Paid {old['name']} {old['amount']} rupees",
+                      payee=old["name"], amount=old["amount"], reason=old["reason"])
+    return {"ok": True, "status": new}
 
 
 @app.post("/dev/simulate-payment/{link_id}")

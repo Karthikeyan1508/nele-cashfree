@@ -1,7 +1,9 @@
-import os, tempfile
+import base64, hashlib, hmac, json, os, tempfile, time
 
 os.environ.update(DB_PATH=os.path.join(tempfile.mkdtemp(), "t.db"), SARVAM_API_KEY="", CASHFREE_CLIENT_ID="",
-                  CASHFREE_CLIENT_SECRET="", TWILIO_SID="", TWILIO_TOKEN="", WHATSAPP_TOKEN="", OWNER_PHONE="9800000000", PAYOUT_PIN="1234", DAILY_PAYOUT_LIMIT="1000",
+                  CASHFREE_CLIENT_SECRET="", CASHFREE_PAYOUT_CLIENT_ID="", CASHFREE_PAYOUT_CLIENT_SECRET="",
+                  CASHFREE_VERIFY_CLIENT_ID="", CASHFREE_VERIFY_CLIENT_SECRET="", TWILIO_SID="", TWILIO_TOKEN="",
+                  WHATSAPP_TOKEN="", OWNER_PHONE="9800000000", PAYOUT_PIN="1234", DAILY_PAYOUT_LIMIT="1000",
                   # blank so tests never place real calls through Sarvam, whatever .env holds
                   SARVAM_VOICE_API_KEY="", SARVAM_ORG_ID="", SARVAM_WORKSPACE_ID="", SARVAM_VOICE_APP_ID="", SARVAM_VOICE_CONNECTION_ID="", SARVAM_VOICE_NUMBER="", SARVAM_ONBOARD_APP_ID="")
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -31,6 +33,14 @@ def tid(c, name):
     return next(t["id"] for t in c.get("/tenants").json() if t["name"] == name)
 
 
+def cf_hook(c, path, body, secret, timestamp=None):
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    ts = str(timestamp or int(time.time()))
+    sig = base64.b64encode(hmac.new(secret.encode(), ts.encode() + raw, hashlib.sha256).digest()).decode()
+    return c.post(path, content=raw, headers={"content-type": "application/json", "x-webhook-timestamp": ts,
+                                              "x-webhook-signature": sig})
+
+
 def test_who_has_not_paid(c):
     j = voice(c, "owner", "Yaaru innu kottilla?")
     assert j["tool_calls"][0]["tool"] == "get_dues"
@@ -51,6 +61,44 @@ def test_half_now_flow_updates_ledger_and_announces(c):
     assert ev[-1]["type"] == "payment_received" and ev[-1]["announce"]["lang"] == "kn"
     row = next(d for d in c.get("/dues").json()["dues"] if d["name"] == "Karthikeyan")
     assert row["paid"] == rent // 2 and row["status"] == "partial"
+
+
+def test_cashfree_payment_webhook_security_and_status(c, monkeypatch):
+    A.q("insert into tenants(name,phone,room,rent,deposit,language) values('Webhook Test','9000000999','104',500,1000,'en')")
+    tenant_id = A.q.last
+    A.q("insert into ledger(tenant_id,month,due) values(?,?,500)", (tenant_id, A.month()))
+    A.q("insert into payments(tenant_id,link_id,amount,month,url) values(?, 'cf_webhook_test',500,?,'')", (tenant_id, A.month()))
+    body = {"type": "PAYMENT_LINK_EVENT", "data": {"link_id": "cf_webhook_test", "link_status": "PAID",
+                                                               "link_amount_paid": 500, "link_currency": "INR",
+                                                               "cf_payment_id": "cf_test_payment_1"}}
+    try:
+        assert c.post("/webhooks/cashfree/payment", json=body).status_code == 503
+        monkeypatch.setattr(A, "CF_SECRET", "test-secret")
+        assert cf_hook(c, "/webhooks/cashfree/payment", body, "wrong-secret").status_code == 401
+        assert cf_hook(c, "/webhooks/cashfree/payment", body, "test-secret", int(time.time()) - 301).status_code == 401
+        failed = {**body, "data": {**body["data"], "link_status": "FAILED"}}
+        assert cf_hook(c, "/webhooks/cashfree/payment", failed, "test-secret").json().get("ignored")
+        assert cf_hook(c, "/webhooks/cashfree/payment", body, "test-secret").json()["pending"] == 0
+        assert cf_hook(c, "/webhooks/cashfree/payment", body, "test-secret").json().get("duplicate")
+    finally:
+        A.q("delete from payments where tenant_id=?", (tenant_id,))
+        A.q("delete from ledger where tenant_id=?", (tenant_id,))
+        A.q("delete from tenants where id=?", (tenant_id,))
+
+
+def test_cashfree_payout_webhook(c, monkeypatch):
+    monkeypatch.setattr(A, "CF_PAYOUT_SECRET", "test-secret")
+    payee_id = A.q("select id from payees where verified=1 limit 1")[0]["id"]
+    A.q("insert into payouts(payee_id,amount,reason,status,cf_transfer_id,day) values(?,500,'test','processing','payout_hook_test',?)",
+        (payee_id, A.dt.date.today().isoformat()))
+    payout_id = A.q.last
+    body = {"type": "TRANSFER_SUCCESS", "data": {"transfer_id": "payout_hook_test", "status": "SUCCESS",
+                                                          "status_code": "COMPLETED"}}
+    try:
+        assert cf_hook(c, "/webhooks/cashfree/payout", body, "test-secret").json()["status"] == "success"
+        assert A.q("select status from payouts where id=?", (payout_id,))[0]["status"] == "success"
+    finally:
+        A.q("delete from payouts where id=?", (payout_id,))
 
 
 def test_tenant_cannot_act_on_others(c):
@@ -141,6 +189,14 @@ def test_strangers_ignored(c):
     n = len(c.get("/messages").json())
     c.post("/whatsapp/simulate", data={"text": "pay raju 100", "tenant_phone": "9123456789"})
     assert len(c.get("/messages").json()) == n
+
+
+def test_tenant_whatsapp_agent_sends_created_payment_link(c):
+    phone = "9000000002"
+    before = A.q("select coalesce(max(id),0) id from messages")[0]["id"]
+    assert c.post("/whatsapp/simulate", data={"text": "send my payment link", "tenant_phone": phone}).status_code == 200
+    sent = A.q("select text from messages where id>? and role='tenant' and direction='out' order by id desc", (before,))
+    assert sent and "/pay/rent_" in sent[0]["text"]
 
 
 def test_pg_facts_for_the_voice_agent(c):

@@ -5,7 +5,6 @@
       "url": "https://mcp.sarvam.ai/voice-agents"
     },
     "cashfree": {
-      "type": "http",
       "url": "https://mcp.cashfree.com/mcp"
     }
   }

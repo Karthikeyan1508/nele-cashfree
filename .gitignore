@@ -3,3 +3,5 @@ static/audio/
 .env
 __pycache__/
 uploads/
+payout.txt
+paymentGateway.csv

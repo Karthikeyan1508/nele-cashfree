@@ -23,7 +23,9 @@ pip install -r requirements.txt
 python -m uvicorn app:app --port 8000      # open http://localhost:8000
 python -m pytest tests -q
 ```
-No keys = **mock mode** (rule-based agent, built-in fake pay page, browser TTS). Copy `.env.example` to `.env` and fill keys for live Sarvam + Cashfree sandbox. For real webhooks run `ngrok http 8000`, set `PUBLIC_URL`, and the link's `notify_url` points at `/webhooks/cashfree/payment`.
+No keys = **mock mode** (rule-based agent, built-in fake pay page, browser TTS). Copy `.env.example` to `.env` and fill keys for live Sarvam + Cashfree sandbox. For Cashfree sandbox webhooks run `ngrok http 8000`, set `PUBLIC_URL`, and register `/webhooks/cashfree/payment` plus `/webhooks/cashfree/payout` in Cashfree. Payment links set their payment `notify_url` automatically.
+
+For business-initiated WhatsApp payment links outside the 24-hour customer-service window, approve a utility template with body variables `{{1}}` tenant name, `{{2}}` amount, and `{{3}}` payment URL, then set `WA_LINK_TEMPLATE` and `WA_TEMPLATE_LANG` in `.env`.
 
 ## Demo
 Owner chips: "Yaaru innu kottilla?" -> "Ellarigu reminder kalsi" -> tenant (Ankit 204) "Half now, half Friday" -> open link, pay -> owner screen turns green + Kannada announcement -> "Electrician Raju ge 800 kodi" -> enter PIN `1234`, Confirm.
