@@ -86,6 +86,26 @@ def test_cashfree_payment_webhook_security_and_status(c, monkeypatch):
         A.q("delete from tenants where id=?", (tenant_id,))
 
 
+def test_cashfree_link_identifies_the_tenant(c, monkeypatch):
+    captured = {}
+
+    async def fake_cf(method, path, version, **kwargs):
+        captured.update(kwargs["json"])
+        return {"link_url": "https://payments-test.cashfree.com/links/test"}
+
+    monkeypatch.setattr(A, "MOCK_CF", False)
+    monkeypatch.setattr(A, "cf", fake_cf)
+    tenant = A.tenant_row(tid(c, "Keshava Karthik"))
+    import asyncio
+    link = asyncio.run(A.make_link(tenant, 1, A.month()))
+    try:
+        assert captured["customer_details"]["customer_name"] == tenant["name"]
+        assert tenant["name"] in captured["link_purpose"]
+        assert captured["link_notes"]["tenant_name"] == tenant["name"]
+    finally:
+        A.q("delete from payments where link_id=?", (link["link_id"],))
+
+
 def test_cashfree_payout_webhook(c, monkeypatch):
     monkeypatch.setattr(A, "CF_PAYOUT_SECRET", "test-secret")
     payee_id = A.q("select id from payees where verified=1 limit 1")[0]["id"]
@@ -99,6 +119,44 @@ def test_cashfree_payout_webhook(c, monkeypatch):
         assert A.q("select status from payouts where id=?", (payout_id,))[0]["status"] == "success"
     finally:
         A.q("delete from payouts where id=?", (payout_id,))
+
+
+def test_cashfree_wallet_uses_available_balance(c, monkeypatch):
+    class Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return self.body
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            return Response({"data": {"token": "payout-token"}})
+
+        async def get(self, *args, **kwargs):
+            return Response({"data": {"balance": "1250.75", "availableBalance": "1000.25"}})
+
+    monkeypatch.setattr(A, "MOCK_PAYOUT", False)
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda **kwargs: Client())
+    A.PAYOUT_TOKEN.update(value=None, expires=0)
+    A.WALLET_CACHE.update(value=None, expires=0)
+    try:
+        wallet = c.get("/wallet").json()
+        assert wallet["available_balance"] == 1000.25
+        assert wallet["ledger_balance"] == 1250.75
+        assert c.get("/summary").json()["wallet_balance"] == 1000.25
+    finally:
+        A.PAYOUT_TOKEN.update(value=None, expires=0)
+        A.WALLET_CACHE.update(value=None, expires=0)
 
 
 def test_tenant_cannot_act_on_others(c):
@@ -197,6 +255,36 @@ def test_tenant_whatsapp_agent_sends_created_payment_link(c):
     assert c.post("/whatsapp/simulate", data={"text": "send my payment link", "tenant_phone": phone}).status_code == 200
     sent = A.q("select text from messages where id>? and role='tenant' and direction='out' order by id desc", (before,))
     assert sent and "/pay/rent_" in sent[0]["text"]
+
+
+def test_owner_offboards_tenant_with_wallet_refund(c, monkeypatch):
+    async def wallet(*args, **kwargs):
+        return {"available_balance": 5000.0, "ledger_balance": 5000.0, "source": "cashfree", "updated_at": ""}
+
+    monkeypatch.setattr(A, "cashfree_wallet", wallet)
+    A.q("insert into tenants(name,phone,room,rent,deposit,language) values('Wallet Test','9000000888','104',500,2000,'en')")
+    tenant_id = A.q.last
+    A.q("insert into ledger(tenant_id,month,due) values(?,?,500)", (tenant_id, A.month()))
+    try:
+        start = voice(c, "owner", "offboard Wallet Test")
+        assert "deduction" in start["reply_en"].lower()
+        prepared = voice(c, "owner", "painting 200")
+        assert prepared["pending_payout"]["status"] == "pending_confirm"
+        assert "Refund ₹1300" in prepared["reply_en"]
+        payout_id = prepared["pending_payout"]["payout_id"]
+        done = c.post("/payouts/confirm", json={"payout_id": payout_id, "pin": "1234"}).json()
+        assert done["status"] == "success"
+        assert A.q("select status from tenants where id=?", (tenant_id,))[0]["status"] == "moved_out"
+    finally:
+        obs = A.q("select id from offboards where tenant_id=?", (tenant_id,))
+        if obs:
+            payees = A.q("select payee_id from payouts where offboard_id=?", (obs[0]["id"],))
+            A.q("delete from payouts where offboard_id=?", (obs[0]["id"],))
+            if payees:
+                A.q("delete from payees where id=?", (payees[0]["payee_id"],))
+            A.q("delete from offboards where id=?", (obs[0]["id"],))
+        A.q("delete from ledger where tenant_id=?", (tenant_id,))
+        A.q("delete from tenants where id=?", (tenant_id,))
 
 
 def test_pg_facts_for_the_voice_agent(c):

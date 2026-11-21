@@ -21,7 +21,8 @@ Every call may carry header `X-Owner-Id` (hardcode `1` for the demo; no auth).
 | pay_vendor — step 1 | `POST /payouts/prepare` | `{payee_id, amount, reason}` | `{payout_id, readback:"Raju Kumar, ₹800", requires_pin:true}` |
 | pay_vendor — step 2 | `POST /payouts/confirm` | `{payout_id, pin}` | `{status:"processing"\|"success"\|"failed", cashfree_transfer_id}` |
 | settle_deposit (stretch) | `POST /deposits/settle` | `{tenant_id, deductions:[{reason, amount}]}` | `{deposit, deductions_total, dues, refund, payout_id}` |
-| monthly_summary | `GET /summary?month=2026-11` | — | `{collected, pending, repairs_spent, beds_vacant, deposits_held}` |
+| offboard tenant | agent tools `start_offboarding` → `finish_offboarding` | tenant + deductions | Refund requiring payout PIN; affordability uses the live Cashfree Payouts available balance |
+| monthly_summary | `GET /summary?month=2026-11` | — | `{collected, pending, repairs_spent, beds_vacant, deposits_held, wallet_balance, wallet_status}` |
 
 Rules enforced **in backend, not the LLM**:
 - `payouts/prepare` rejects unless payee `verified=true` and saved. LLM never sees raw account numbers.

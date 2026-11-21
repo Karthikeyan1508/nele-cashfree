@@ -23,6 +23,7 @@ CF_PAYOUT_SECRET = os.getenv("CASHFREE_PAYOUT_CLIENT_SECRET") or CF_SECRET
 CF_VERIFY_ID = os.getenv("CASHFREE_VERIFY_CLIENT_ID") or CF_ID
 CF_VERIFY_SECRET = os.getenv("CASHFREE_VERIFY_CLIENT_SECRET") or CF_SECRET
 CF_BASE = os.getenv("CASHFREE_BASE", "https://sandbox.cashfree.com")
+CF_PAYOUT_BASE = os.getenv("CASHFREE_PAYOUT_BASE", "https://payout-gamma.cashfree.com" if "sandbox" in CF_BASE else "https://payout-api.cashfree.com")
 MOCK_CF = not (CF_ID and CF_SECRET)
 MOCK_PAYOUT = not (CF_PAYOUT_ID and CF_PAYOUT_SECRET)
 MOCK_VERIFY = not (CF_VERIFY_ID and CF_VERIFY_SECRET)
@@ -70,7 +71,8 @@ create table if not exists calls(id integer primary key, tenant_id int, month te
 create table if not exists messages(id integer primary key, ts text default current_timestamp, phone text, role text, direction text, kind text, text text, audio_url text, channel text default 'whatsapp', wa_id text unique);
 create table if not exists promises(id integer primary key, tenant_id int, amount int, date text, reason text, ts text default current_timestamp);
 create table if not exists payees(id integer primary key, name text, account_no text, ifsc text, verified int default 0, bank_name text);
-create table if not exists payouts(id integer primary key, payee_id int, amount int, reason text, kind text default 'vendor', status text, cf_transfer_id text, day text);
+create table if not exists payouts(id integer primary key, payee_id int, amount int, reason text, kind text default 'vendor', status text, cf_transfer_id text, day text, offboard_id int);
+create table if not exists offboards(id integer primary key, tenant_id int, deductions_json text default '[]', refund int, status text default 'awaiting_deductions', created text default current_timestamp);
 create table if not exists tickets(id integer primary key, tenant_id int, issue text, status text default 'open', ts text default current_timestamp);
 create table if not exists audit_log(id integer primary key, ts text, actor text, action text, payload text);
 create unique index if not exists payments_txn_id_uq on payments(txn_id) where txn_id is not null;
@@ -212,6 +214,48 @@ async def cf(method, path, ver, idempotency_key=None, credentials=None, **kw):
         return r.json()
 
 
+PAYOUT_TOKEN = {"value": None, "expires": 0.0}
+WALLET_CACHE = {"value": None, "expires": 0.0}
+
+
+async def cashfree_wallet(force=False):
+    """Cashfree Payouts available balance; never falls back to a local estimate."""
+    now = asyncio.get_running_loop().time()
+    if not force and WALLET_CACHE["value"] and WALLET_CACHE["expires"] > now:
+        return WALLET_CACHE["value"]
+    if MOCK_PAYOUT:
+        raise ToolError("Cashfree Payouts credentials are not configured")
+    if not PAYOUT_TOKEN["value"] or PAYOUT_TOKEN["expires"] <= now:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(CF_PAYOUT_BASE + "/payout/v1/authorize", headers={
+                "x-client-id": CF_PAYOUT_ID, "x-client-secret": CF_PAYOUT_SECRET})
+        if r.status_code >= 400:
+            raise ToolError(f"Cashfree Payouts auth failed ({r.status_code})")
+        body = r.json()
+        token = (body.get("data") or {}).get("token") or body.get("token")
+        if not token:
+            raise ToolError("Cashfree Payouts auth returned no token")
+        PAYOUT_TOKEN.update(value=token, expires=now + 300)
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(CF_PAYOUT_BASE + "/payout/v1.2/getBalance", headers={
+            "authorization": f"Bearer {PAYOUT_TOKEN['value']}", "content-type": "application/json"})
+    if r.status_code >= 400:
+        PAYOUT_TOKEN["expires"] = 0
+        raise ToolError(f"Cashfree balance fetch failed ({r.status_code})")
+    data = (r.json().get("data") or {})
+    try:
+        value = {"available_balance": float(data["availableBalance"]), "ledger_balance": float(data["balance"]),
+                 "source": "cashfree", "updated_at": dt.datetime.now().isoformat(timespec="seconds")}
+    except (KeyError, TypeError, ValueError):
+        raise ToolError("Cashfree balance response was invalid")
+    WALLET_CACHE.update(value=value, expires=now + 10)
+    return value
+
+
+def refresh_wallet():
+    WALLET_CACHE["expires"] = 0
+
+
 # ---------- events ----------
 EVENTS = []
 
@@ -246,13 +290,16 @@ def find_tenant(tid=None, name=None):
 
 async def make_link(t, amount, mon, purpose=None):
     link_id = f"rent_{t['id']}_{uuid.uuid4().hex[:8]}"
+    purpose = purpose or f"Rent {mon} Room {t['room']}"
+    purpose = purpose if t["name"].lower() in purpose.lower() else f"{t['name']} - {purpose}"
     if MOCK_CF:
         url = f"{PUBLIC_URL}/pay/{link_id}"
     else:
         j = await cf("POST", "/pg/links", "2025-01-01", idempotency_key=link_id, json={
             "link_id": link_id, "link_amount": amount, "link_currency": "INR",
-            "link_purpose": purpose or f"Rent {mon} Room {t['room']}",
+            "link_purpose": purpose,
             "customer_details": {"customer_name": t["name"], "customer_phone": t["phone"]},
+            "link_notes": {"tenant_name": t["name"], "room": t["room"]},
             "link_partial_payments": False, "link_notify": {"send_sms": False, "send_email": False},
             "link_meta": {"notify_url": PUBLIC_URL + "/webhooks/cashfree/payment"}})
         url = j["link_url"]
@@ -408,11 +455,14 @@ async def confirm_payout(payout_id, pin):
     if not r or r[0]["status"] != "pending_confirm":
         raise ToolError("payout not awaiting confirmation")
     o = r[0]
-    if spent_today() + o["amount"] > DAILY_LIMIT:
+    wallet_refund = o["kind"] == "deposit" and o.get("offboard_id")
+    if wallet_refund and o["amount"] > (await cashfree_wallet())["available_balance"]:
+        raise ToolError("owner wallet balance is too low for this refund")
+    if not wallet_refund and spent_today() + o["amount"] > DAILY_LIMIT:
         raise ToolError("daily payout limit exceeded")
-    tid = f"payout_{o['id']}_{uuid.uuid4().hex[:6]}"
+    tid = f"wallet_refund_{o['id']}" if wallet_refund else f"payout_{o['id']}_{uuid.uuid4().hex[:6]}"
     status = "success"
-    if not MOCK_PAYOUT:
+    if not wallet_refund and not MOCK_PAYOUT:
         q("update payouts set status='processing', cf_transfer_id=? where id=?", (tid, o["id"]))
         try:
             j = await cf("POST", "/payout/transfers", "2024-01-01", idempotency_key=tid,
@@ -427,8 +477,12 @@ async def confirm_payout(payout_id, pin):
             audit("owner", "payout_status_unknown", {"payout_id": o["id"], "transfer_id": tid, "err": str(e)})
             raise ToolError(f"payout submitted but status is unknown; reconcile transfer {tid}")
     q("update payouts set status=?, cf_transfer_id=? where id=?", (status, tid, o["id"]))
+    refresh_wallet()
     audit("owner", "payout_confirmed", {"payout_id": o["id"], "amount": o["amount"], "to": o["name"], "status": status})
     if status == "success":
+        if wallet_refund:
+            q("update offboards set status='refunded' where id=?", (o["offboard_id"],))
+            q("update tenants set status='moved_out' where id=(select tenant_id from offboards where id=?)", (o["offboard_id"],))
         await publish("payout_done", f"Paid {o['name']} {o['amount']} rupees", payee=o["name"], amount=o["amount"], reason=o["reason"])
     return {"status": status, "cashfree_transfer_id": tid}
 
@@ -451,14 +505,71 @@ async def t_settle_deposit(tenant_id, deductions=None, account_no=None, ifsc=Non
     return out
 
 
+async def t_start_offboarding(tenant_id):
+    t = tenant_row(int(tenant_id))
+    old = q("select * from offboards where tenant_id=? and status in ('awaiting_deductions','pending_refund') order by id desc limit 1", (t["id"],))
+    if old:
+        oid = old[0]["id"]
+    else:
+        q("insert into offboards(tenant_id) values(?)", (t["id"],))
+        oid = q.last
+    return {"offboard_id": oid, "tenant_id": t["id"], "tenant": t["name"], "deposit": t["deposit"],
+            "question": f"What deductions should I make from {t['name']}'s deposit of ₹{t['deposit']}? Say no deductions, or give each reason and amount."}
+
+
+async def t_finish_offboarding(tenant_id, deductions=None):
+    t = tenant_row(int(tenant_id))
+    ob = q("select * from offboards where tenant_id=? and status='awaiting_deductions' order by id desc limit 1", (t["id"],))
+    if not ob:
+        raise ToolError("start offboarding this tenant first")
+    deductions = deductions or []
+    clean = []
+    for d in deductions:
+        reason, amount = str(d.get("reason") or "deduction").strip()[:100], int(d.get("amount") or 0)
+        if amount < 0:
+            raise ToolError("deductions cannot be negative")
+        if amount:
+            clean.append({"reason": reason, "amount": amount})
+    deducted = sum(d["amount"] for d in clean)
+    if deducted > t["deposit"]:
+        raise ToolError("deductions cannot exceed the deposit")
+    dues = (await t_get_dues(t["id"], False))["dues"]
+    unpaid = max(dues[0]["pending"], 0) if dues else 0
+    refund = max(t["deposit"] - deducted - unpaid, 0)
+    balance = (await cashfree_wallet())["available_balance"]
+    if refund > balance:
+        raise ToolError(f"owner wallet has ₹{balance:g}, but the refund is ₹{refund}")
+    oid = ob[0]["id"]
+    q("update offboards set deductions_json=?, refund=?, status=? where id=?",
+      (json.dumps(clean), refund, "pending_refund" if refund else "complete", oid))
+    if not refund:
+        q("update tenants set status='moved_out' where id=?", (t["id"],))
+        return {"offboard_id": oid, "tenant": t["name"], "deposit": t["deposit"], "deductions": clean,
+                "unpaid_dues": unpaid, "refund": 0, "status": "moved_out", "wallet_balance": balance}
+    q("insert into payees(name,verified,bank_name) values(?,1,?)", (f"Tenant refund - {t['name']}", t["name"]))
+    payee_id = q.last
+    q("insert into payouts(payee_id,amount,reason,kind,status,day,offboard_id) values(?,?,?,'deposit','pending_confirm',?,?)",
+      (payee_id, refund, f"Deposit refund Room {t['room']}", dt.date.today().isoformat(), oid))
+    payout = {"payout_id": q.last, "readback": f"Refund {t['name']} ₹{refund} from owner wallet",
+              "requires_pin": True, "status": "pending_confirm"}
+    return {"offboard_id": oid, "tenant": t["name"], "deposit": t["deposit"], "deductions": clean,
+            "unpaid_dues": unpaid, "refund": refund, "wallet_balance": balance, "payout": payout}
+
+
 async def t_monthly_summary(month_=None):
     m = month_ or month()
     l = q("select coalesce(sum(paid),0) c, coalesce(sum(due-paid),0) p from ledger where month=?", (m,))[0]
     rep = q("select coalesce(sum(amount),0) s from payouts where kind='vendor' and status in ('success','processing') and substr(day,1,7)=?", (m,))[0]["s"]
     act = q("select count(*) n, coalesce(sum(deposit),0) d from tenants where status='active'")[0]
     tot = l["c"] + l["p"]
+    try:
+        balance = (await cashfree_wallet())["available_balance"]
+        wallet_status = "live"
+    except ToolError:
+        balance, wallet_status = None, "unavailable"
     return {"collected": l["c"], "pending": l["p"], "collection_rate": round(100 * l["c"] / tot) if tot else 0,
-            "repairs_spent": rep, "beds_vacant": PROPERTY["beds"] - act["n"], "deposits_held": act["d"], "month": m}
+            "repairs_spent": rep, "beds_vacant": PROPERTY["beds"] - act["n"], "deposits_held": act["d"],
+            "wallet_balance": balance, "wallet_status": wallet_status, "month": m}
 
 
 def P(**props):  # schema helper: P(name="string", amount="integer")
@@ -486,6 +597,12 @@ TOOLS = {
     "prepare_payout": (t_prepare_payout, "Prepare a payment to a saved verified payee (vendor). Does NOT send money; the owner must confirm with a PIN in the app.",
                        P(payee_name="string", amount="integer", reason="string"), {"owner"}),
     "settle_deposit": (t_settle_deposit, "Compute deposit refund at move-out. deductions=[{reason,amount}].", P(tenant_id="integer"), {"owner"}),
+    "start_offboarding": (t_start_offboarding, "Start moving out a tenant and ask the owner for deposit deductions.",
+                           P(tenant_name="string"), {"owner"}),
+    "finish_offboarding": (t_finish_offboarding, "Apply move-out deductions and prepare the remaining deposit refund after checking the live Cashfree wallet. Refunds require PIN confirmation.",
+                            {"type": "object", "properties": {"tenant_id": {"type": "integer"}, "deductions": {"type": "array", "items": {
+                                "type": "object", "properties": {"reason": {"type": "string"}, "amount": {"type": "integer"}},
+                                "required": ["reason", "amount"]}}}, "required": ["tenant_id", "deductions"]}, {"owner"}),
     "monthly_summary": (t_monthly_summary, "This month's collected, pending, repairs, vacant beds, deposits held.", P(), {"owner"}),
     "verify_payee": (t_verify_payee, "Verify and save a payee's bank account.", P(name="string", account_no="string", ifsc="string"), {"owner"}),
 }
@@ -517,8 +634,13 @@ def sys_prompt(role, t):
     base = (f"You are Kiraya Mitra, a PG rent assistant. Today is {dt.date.today().isoformat()}. The user may write in any Indian language, even in Roman letters. "
             "ALWAYS reply in plain English only (it is translated afterwards), in 1-2 short sentences, no markdown. Never invent data: call tools. ")
     if role == "owner":
+        pending = q("select t.id tenant_id, t.name from offboards o join tenants t on t.id=o.tenant_id "
+                    "where o.status='awaiting_deductions' order by o.id desc limit 1")
+        move = (f" {pending[0]['name']} (tenant id {pending[0]['tenant_id']}) is awaiting move-out deductions. "
+                "Ask for reasons and amounts, then call finish_offboarding with a deductions array; use an empty array for no deductions."
+                if pending else " For move-out, call start_offboarding first and ask for deductions before calling finish_offboarding.")
         return base + ("You talk to the PG owner. Never claim money was sent: prepare_payout only prepares; tell the owner to confirm with PIN in the app. "
-                       "For 'who hasn't paid' call get_dues.")
+                       "For 'who hasn't paid' call get_dues." + move)
     return base + (f"You talk to tenant {t['name']} (room {t['room']}, id {t['id']}). If they want to pay now, create_rent_link. "
                    "If they say pay half now, create_rent_link with half the pending amount and log_promise for the remainder on the day they name. "
                    "If they promise a later date, log_promise. For problems, create_ticket.")
@@ -564,12 +686,32 @@ async def rules(text, role, tenant):  # offline/demo fallback when no Sarvam key
         return r
 
     if role == "owner":
+        pending_move = q("select t.id tenant_id, t.name from offboards o join tenants t on t.id=o.tenant_id "
+                         "where o.status='awaiting_deductions' order by o.id desc limit 1")
+        if pending_move:
+            deductions = []
+            if not re.search(r"\b(no|zero) deductions?\b|\bnothing\b", t):
+                pairs = re.findall(r"([a-z][a-z ]{0,40}?)\s+₹?\s*(\d[\d,]*)", t)
+                if not pairs:
+                    return f"Tell me each deduction and amount for {pending_move[0]['name']}, or say no deductions.", calls
+                deductions = [{"reason": reason.strip(" ,"), "amount": int(amount.replace(",", ""))}
+                              for reason, amount in pairs]
+            r = await use("finish_offboarding", {"tenant_id": pending_move[0]["tenant_id"], "deductions": deductions})
+            if r.get("error"):
+                return r["error"], calls
+            if r.get("payout"):
+                return (f"Deposit ₹{r['deposit']}, deductions ₹{sum(x['amount'] for x in r['deductions'])}, unpaid rent ₹{r['unpaid_dues']}. "
+                        f"Refund ₹{r['refund']} from the owner wallet. Confirm with your PIN."), calls
+            return f"No refund is due. {r['tenant']} has been moved out.", calls
         if re.search(r"remind|kalsi|ellarigu|call (all|them)", t):
             r = await use("send_reminders", {})
             s = r.get("calls", [])
             return (f"Calling {len(s)} tenants now in their own languages: " + ", ".join(x["name"] for x in s) + "." if s
                     else "Nobody has pending rent."), calls
         who = next((x for x in q("select name from tenants where status='active'") if x["name"].lower() in t), None)
+        if who and re.search(r"offboard|move.?out|vacat|check.?out", t):
+            r = await use("start_offboarding", {"tenant_name": who["name"]})
+            return r.get("error") or r["question"], calls
         if who and re.search(r"cash|received|got|record", t) and re.search(r"\d", t):
             r = await use("record_payment", {"tenant_name": who["name"], "amount": int(re.search(r"(\d[\d,]*)", t).group(1).replace(",", "")),
                                              "method": "cash" if "cash" in t else "upi"})
@@ -585,8 +727,9 @@ async def rules(text, role, tenant):  # offline/demo fallback when no Sarvam key
                     if d else "Everyone has paid."), calls
         if re.search(r"summary|lekka|accounts|report", t):
             s = await use("monthly_summary", {})
+            wallet = f"₹{s['wallet_balance']:g}" if s["wallet_balance"] is not None else "unavailable"
             return (f"Collected ₹{s['collected']}, pending ₹{s['pending']}, repairs ₹{s['repairs_spent']}, "
-                    f"{s['beds_vacant']} beds vacant, deposits held ₹{s['deposits_held']}."), calls
+                    f"{s['beds_vacant']} beds vacant, deposits held ₹{s['deposits_held']}, Cashfree wallet {wallet}."), calls
         m = re.search(r"onboard (\w[\w ]*?) (\d{10}) room (\w+)", t)
         if m:
             r = await use("start_onboarding", {"name": m.group(1).title(), "phone": m.group(2), "room": m.group(3)})
@@ -1157,6 +1300,7 @@ async def apply_payment(link_id, total_paid, txn=None, background_tasks=None):
 
 
 async def payment_notifications(p, delta, left, txn, receipt_no):
+    refresh_wallet()
     audit("cashfree", "payment_received", {"link_id": p["link_id"], "delta": delta, "txn": txn, "receipt": receipt_no})
     await publish("payment_received", f"Room {p['room']}, {p['name']}, payment of {delta} rupees received.",
                   f"ಕೊಠಡಿ {p['room']}, {p['name']}, ₹{delta} ಬಂದಿದೆ", tenant_id=p["tenant_id"], room=p["room"], name=p["name"],
@@ -1180,11 +1324,12 @@ async def send_receipts(p, delta, left, txn, receipt_no):
 async def lifespan(_):
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
-    try:  # databases created before onboarding existed
-        c.execute("alter table tenants add column whatsapp text")
-        c.commit()
-    except sqlite3.OperationalError:
-        pass
+    for migration in ("alter table tenants add column whatsapp text", "alter table payouts add column offboard_id int"):
+        try:
+            c.execute(migration)
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
     c.close()
     seed()
     ensure_month()
@@ -1229,6 +1374,14 @@ def payees():
 @app.get("/summary")
 async def summary():
     return await t_monthly_summary()
+
+
+@app.get("/wallet")
+async def wallet():
+    try:
+        return await cashfree_wallet()
+    except ToolError as e:
+        raise HTTPException(503, str(e))
 
 
 @app.get("/events")
@@ -1339,6 +1492,7 @@ async def webhook_payout(request: Request):
     else:
         new = "processing"
     q("update payouts set status=? where id=?", (new, old["id"]))
+    refresh_wallet()
     audit("cashfree", "payout_status", {"payout_id": old["id"], "transfer_id": transfer_id, "status": new})
     if new == "success" and old["status"] != "success":
         await publish("payout_done", f"Paid {old['name']} {old['amount']} rupees",

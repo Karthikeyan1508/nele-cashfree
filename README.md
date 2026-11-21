@@ -4,6 +4,8 @@ Voice agent for PG owners: collect rent, chase late payers, pay vendors, settle 
 
 ## Architecture
 - **Owner <-> WhatsApp voice agent**: owner sends voice notes (Kannada/English); Saaras transcribes, Sarvam-105B calls tools, Mayura+Bulbul reply as a voice note + text. Doubts, analytics, vendor payouts, cash entries. Payout PIN is typed (`CONFIRM 1234`), never spoken.
+- **Move-out refunds**: the owner asks to offboard a tenant, gives deposit deductions, then confirms the refund with the payout PIN; affordability uses the live Cashfree Payouts balance.
+- **Cashfree wallet**: the owner dashboard reads Cashfree's live available Payouts balance and refreshes it after payment and payout webhooks.
 - **Tenants <-> phone calls**: reminders are outbound calls (Twilio) in the tenant's language. Keypad: 1 = link by SMS, 2 = half now + rest Friday, 3 = pay in 3 days. Outcome is reported to the owner on WhatsApp.
 - **Dashboard** (`dashboard/`, Next.js + shadcn): overview, tenants, per-tenant detail, month-wise rent ledger, activity/audit log, WhatsApp chat simulator.
 

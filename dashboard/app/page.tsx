@@ -2,7 +2,7 @@
 import { useState } from "react"
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts"
 import { toast } from "sonner"
-import { AlertCircle, BedDouble, CalendarDays, Landmark, PhoneCall, Wallet, Wrench } from "lucide-react"
+import { AlertCircle, BedDouble, CalendarDays, HandCoins, Landmark, PhoneCall, Wallet, Wrench } from "lucide-react"
 import { PageHeader } from "@/components/page-header"
 import { PersonAvatar } from "@/components/person-avatar"
 import { Pick } from "@/components/pick"
@@ -17,7 +17,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { LedgerRow, inr, monthLabel, post, useApi } from "@/lib/api"
 
 type Overview = {
-  summary: { collected: number; pending: number; collection_rate: number; repairs_spent: number; beds_vacant: number; deposits_held: number; month: string }
+  summary: { collected: number; pending: number; collection_rate: number; repairs_spent: number; beds_vacant: number; deposits_held: number; wallet_balance: number | null; wallet_status: "live" | "unavailable"; month: string }
   series: { month: string; due: number; paid: number }[]
   statuses: { status: string; n: number }[]
   open_tickets: number
@@ -54,6 +54,7 @@ export default function Overview() {
     { label: "Pending", value: inr(s.pending), hint: `${late.length} ${late.length === 1 ? "tenant" : "tenants"} yet to pay`, icon: CalendarDays, tone: "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300" },
     { label: "Repairs paid", value: inr(s.repairs_spent), hint: `${ov.data.open_tickets} open tickets`, icon: Wrench, tone: "bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300" },
     { label: "Deposits held", value: inr(s.deposits_held), hint: `from ${ov.data.tenants} tenants`, icon: Landmark, tone: "bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-300" },
+    { label: "Cashfree wallet", value: s.wallet_balance == null ? "Unavailable" : inr(s.wallet_balance), hint: s.wallet_status === "live" ? "Live available payout balance" : "Connect Cashfree Payouts credentials", icon: HandCoins, tone: "bg-teal-100 text-teal-700 dark:bg-teal-950 dark:text-teal-300" },
     { label: "Beds vacant", value: String(s.beds_vacant), hint: `of ${ov.data.tenants + s.beds_vacant} beds`, icon: BedDouble, tone: "bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300" },
   ] : []
 
@@ -68,8 +69,8 @@ export default function Overview() {
         <Alert variant="destructive"><AlertCircle /><AlertTitle>Backend unreachable</AlertTitle><AlertDescription>{ov.error}</AlertDescription></Alert>
       )}
 
-      <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-5">
-        {!ov.data && Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-32 rounded-xl" />)}
+      <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+        {!ov.data && Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-32 rounded-xl" />)}
         {kpis.map(({ label, value, hint, icon: Icon, tone }) => (
           <Card key={label}>
             <CardHeader>
