@@ -372,7 +372,7 @@ def form(**kw):
     return base
 
 
-def test_onboarding_flow(c):
+def test_onboarding_flow(c, monkeypatch):
     r = c.post("/onboarding/start", json={"name": "Ravi Kumar", "phone": "9876500001", "room": "302"}).json()
     assert r["status"] == "link_sent"  # no voice agent in tests: the form goes straight to WhatsApp
     ob = A.q("select * from onboarding where id=?", (r["onboarding_id"],))[0]
@@ -391,18 +391,54 @@ def test_onboarding_flow(c):
     assert "required" in c.post(url, data=form(), files={"photo": ("p.png", PNG, "image/png")}).json()["detail"]
     assert c.post(url, data={k: v for k, v in form().items() if k != "address"}, files=files()).status_code == 400
 
-    assert c.post(url, data=form(), files=files()).json() == {"ok": True}
+    assert c.post(url, data=form(autopay="yes"), files=files()).json() == {"ok": True}
     assert c.post(url, data=form(), files=files()).status_code == 409  # one submission per link
     d = c.get(f"/onboarding/{ob['id']}").json()
     assert d["status"] == "submitted" and d["form"]["primary_language"] == "Kannada" and d["has_aadhaar"] and d["has_photo"]
     assert c.get(f"/onboarding/{ob['id']}/file/photo").content == PNG
     assert any("Ravi Kumar" in m["text"] and "Email: ravi@example.com" in m["text"] for m in c.get("/messages").json() if m["direction"] == "out")
 
-    tid = c.post(f"/onboarding/{ob['id']}/approve").json()["tenant_id"]
+    captured = {}
+
+    async def fake_cf(method, path, version, **kwargs):
+        if path == "/pg/links":
+            return {"link_url": "https://payments-test.cashfree.com/first-rent"}
+        captured.update(kwargs["json"])
+        return {"subscription_session_id": "subs_session_test", "subscription_status": "INITIALIZED",
+                "cf_subscription_id": "cf_sub_test"}
+
+    monkeypatch.setattr(A, "MOCK_CF", False)
+    monkeypatch.setattr(A, "cf", fake_cf)
+    approved = c.post(f"/onboarding/{ob['id']}/approve").json()
+    tid = approved["tenant_id"]
+    assert approved["autopay_status"] == "initialized"
     t = c.get(f"/tenants/{tid}").json()
     assert t["tenant"]["room"] == "302" and t["tenant"]["rent"] == 7000 and t["tenant"]["deposit"] == 14000
     assert t["tenant"]["language"] == "kn" and t["tenant"]["whatsapp"] == "9876500002"  # primary language and WhatsApp number carried over
     assert t["profile"] and "ravi@example.com" in t["profile"]["form_json"]
+    auto = A.q("select * from autopay where tenant_id=?", (tid,))[0]
+    assert auto["first_charge"].startswith("2027-01-05") and auto["session_id"] == "subs_session_test"
+    assert captured["plan_details"]["plan_amount"] == 7000 and captured["authorization_details"]["payment_methods"] == ["upi"]
+    assert "subscriptionsCheckout" in c.get(f"/autopay/{auto['token']}").text
+    assert any(auto["token"] in m["text"] for m in A.q("select text from messages where role='tenant' and direction='out'"))
+
+    monkeypatch.setattr(A, "CF_SECRET", "test-secret")
+    failed_auth = {"type": "SUBSCRIPTION_AUTH_STATUS", "data": {"subscription_id": auto["subscription_id"],
+                   "subscription_details": {"subscription_id": auto["subscription_id"], "subscription_status": "ACTIVE"},
+                   "authorization_details": {"authorization_status": "FAILED"}, "payment_type": "AUTH", "payment_status": "FAILED"}}
+    assert cf_hook(c, "/webhooks/cashfree/subscription", failed_auth, "test-secret").json()["status"] == "failed"
+    assert A.q("select status from autopay where id=?", (auto["id"],))[0]["status"] == "failed"
+    auth = {"type": "SUBSCRIPTION_AUTH_STATUS", "data": {"subscription_id": auto["subscription_id"],
+            "subscription_details": {"subscription_id": auto["subscription_id"], "subscription_status": "ACTIVE"},
+            "authorization_details": {"authorization_status": "ACTIVE"}, "payment_type": "AUTH"}}
+    assert cf_hook(c, "/webhooks/cashfree/subscription", auth, "test-secret").json()["status"] == "active"
+    paid = {"type": "SUBSCRIPTION_PAYMENT_SUCCESS", "data": {"subscription_id": auto["subscription_id"],
+            "subscription_details": {"subscription_id": auto["subscription_id"], "subscription_status": "ACTIVE"},
+            "payment_type": "CHARGE", "payment_amount": 7000, "payment_currency": "INR",
+            "payment_schedule_date": "2027-01-05T10:00:00+05:30", "cf_payment_id": "cf_autopay_1"}}
+    assert cf_hook(c, "/webhooks/cashfree/subscription", paid, "test-secret").json()["pending"] == 0
+    assert cf_hook(c, "/webhooks/cashfree/subscription", paid, "test-secret").json()["duplicate"]
+    assert A.q("select method,status from payments where txn_id='cf_autopay_1'")[0] == {"method": "autopay", "status": "paid"}
     assert c.post(f"/onboarding/{ob['id']}/approve").status_code == 400
 
 

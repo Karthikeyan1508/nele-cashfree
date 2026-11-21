@@ -1,7 +1,7 @@
 "use client"
 import { useState } from "react"
 import { toast } from "sonner"
-import { Check, Copy, ExternalLink, FileText, Plus, RefreshCw, X } from "lucide-react"
+import { Check, Copy, ExternalLink, FileText, Plus, RefreshCw, Repeat2, X } from "lucide-react"
 import { PageHeader } from "@/components/page-header"
 import { PersonAvatar } from "@/components/person-avatar"
 import { Pick } from "@/components/pick"
@@ -17,8 +17,8 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { LANG, inr, post, useApi } from "@/lib/api"
 
-type Row = { id: number; name: string; phone: string; room: string; sharing: number; status: string; call_outcome: string | null; created: string; submitted_at: string | null; tenant_id: number | null }
-type Detail = Row & { rent: number; deposit: number; whatsapp: string | null; link: string; has_aadhaar: boolean; has_photo: boolean; form: Record<string, string> }
+type Row = { id: number; name: string; phone: string; room: string; sharing: number; status: string; call_outcome: string | null; created: string; submitted_at: string | null; tenant_id: number | null; autopay_status: string }
+type Detail = Row & { rent: number; deposit: number; whatsapp: string | null; link: string; has_aadhaar: boolean; has_photo: boolean; form: Record<string, string>; autopay: { status: string; first_charge: string; last_payment_status: string | null } | null }
 type Room = { room: string; sharing: number; rent: number; occupants: unknown[] }
 
 const FIELDS: [string, string][] = [
@@ -75,8 +75,10 @@ function Review({ id, onClose, onChange }: { id: number | null; onClose: () => v
   const { data: d, reload } = useApi<Detail>(id ? `/onboarding/${id}` : null, 5000)
   async function act(path: string, ok: string) {
     try {
-      await post(`/onboarding/${id}/${path}`)
-      toast.success(ok); reload(); onChange()
+      const result = await post<{ autopay_status?: string }>(`/onboarding/${id}/${path}`)
+      if (result.autopay_status === "setup_failed") toast.warning(`${ok}, but Cashfree AutoPay could not be started`)
+      else toast.success(ok)
+      reload(); onChange()
     } catch (e) { toast.error(String(e).replace("Error: ", "")) }
   }
   return (
@@ -97,6 +99,17 @@ function Review({ id, onClose, onChange }: { id: number | null; onClose: () => v
                 <div><div className="text-xs text-muted-foreground">Phone</div>{d.phone}</div>
                 <div><div className="text-xs text-muted-foreground">WhatsApp</div>{d.whatsapp ?? "Same as phone"}</div>
               </div>
+              {(d.form.autopay === "yes" || d.autopay) && (
+                <div className="flex items-start gap-3 rounded-xl bg-teal-50 p-3 text-teal-950 dark:bg-teal-950 dark:text-teal-50">
+                  <Repeat2 className="mt-0.5 size-4 shrink-0" />
+                  <div className="min-w-0 flex-1"><div className="font-medium">Monthly rent AutoPay</div>
+                    <div className="text-xs text-teal-800 dark:text-teal-200">
+                      {d.autopay ? `Cashfree mandate: ${d.autopay.status.replace(/_/g, " ")} · first charge ${new Date(d.autopay.first_charge).toLocaleDateString("en-IN")}` : "Requested by tenant; setup begins after approval"}
+                    </div>
+                  </div>
+                  {d.autopay && <StatusBadge status={d.autopay.status} />}
+                </div>
+              )}
               <Separator />
               {d.status === "submitted" || d.status === "approved" ? (
                 <>
@@ -136,19 +149,20 @@ export default function Onboarding() {
       <Card>
         <CardContent className="px-0">
           <Table>
-            <TableHeader><TableRow><TableHead>Person</TableHead><TableHead>Room</TableHead><TableHead>Status</TableHead><TableHead>Call</TableHead><TableHead>Started</TableHead></TableRow></TableHeader>
+            <TableHeader><TableRow><TableHead>Person</TableHead><TableHead>Room</TableHead><TableHead>Status</TableHead><TableHead>AutoPay</TableHead><TableHead>Call</TableHead><TableHead>Started</TableHead></TableRow></TableHeader>
             <TableBody>
-              {!data && Array.from({ length: 3 }).map((_, i) => <TableRow key={i}><TableCell colSpan={5}><Skeleton className="h-8 w-full" /></TableCell></TableRow>)}
+              {!data && Array.from({ length: 3 }).map((_, i) => <TableRow key={i}><TableCell colSpan={6}><Skeleton className="h-8 w-full" /></TableCell></TableRow>)}
               {(data ?? []).map((r) => (
                 <TableRow key={r.id} className="cursor-pointer" onClick={() => setOpen(r.id)}>
                   <TableCell><div className="flex items-center gap-3"><PersonAvatar name={r.name} className="size-9" /><div className="leading-tight"><div className="font-medium">{r.name}</div><div className="text-xs text-muted-foreground">{r.phone}</div></div></div></TableCell>
                   <TableCell>{r.room} <span className="text-xs text-muted-foreground">{r.sharing}-sharing</span></TableCell>
                   <TableCell><StatusBadge status={r.status} /></TableCell>
+                  <TableCell><StatusBadge status={r.autopay_status} /></TableCell>
                   <TableCell className="capitalize text-muted-foreground">{r.call_outcome?.replace(/_/g, " ") ?? "—"}</TableCell>
                   <TableCell className="text-muted-foreground">{r.created}</TableCell>
                 </TableRow>
               ))}
-              {data && !data.length && <TableRow><TableCell colSpan={5} className="py-10 text-center text-muted-foreground">No onboarding yet. Start one for a new tenant.</TableCell></TableRow>}
+              {data && !data.length && <TableRow><TableCell colSpan={6} className="py-10 text-center text-muted-foreground">No onboarding yet. Start one for a new tenant.</TableCell></TableRow>}
             </TableBody>
           </Table>
         </CardContent>

@@ -1,6 +1,6 @@
 """Kiraya Mitra backend: voice agent for PG owners. Sarvam (voice/LLM) + Cashfree (money).
 Runs fully in MOCK mode with no keys (fake payment page, canned translations) so the demo never dies."""
-import asyncio, random, base64, datetime as dt, hashlib, hmac, json, os, re, sqlite3, uuid
+import asyncio, random, base64, datetime as dt, hashlib, hmac, html, json, os, re, sqlite3, uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -73,6 +73,7 @@ create table if not exists promises(id integer primary key, tenant_id int, amoun
 create table if not exists payees(id integer primary key, name text, account_no text, ifsc text, verified int default 0, bank_name text);
 create table if not exists payouts(id integer primary key, payee_id int, amount int, reason text, kind text default 'vendor', status text, cf_transfer_id text, day text, offboard_id int);
 create table if not exists offboards(id integer primary key, tenant_id int, deductions_json text default '[]', refund int, status text default 'awaiting_deductions', created text default current_timestamp);
+create table if not exists autopay(id integer primary key, tenant_id int unique, subscription_id text unique, cf_subscription_id text, token text unique, session_id text, status text default 'requested', first_charge text, last_payment_status text, created text default current_timestamp);
 create table if not exists tickets(id integer primary key, tenant_id int, issue text, status text default 'open', ts text default current_timestamp);
 create table if not exists audit_log(id integer primary key, ts text, actor text, action text, payload text);
 create unique index if not exists payments_txn_id_uq on payments(txn_id) where txn_id is not null;
@@ -1165,6 +1166,60 @@ def ob_url(ob):
     return f"{PUBLIC_URL}/onboard/{ob['token']}"
 
 
+def next_rent_charge(move_in):
+    try:
+        d = dt.date.fromisoformat(move_in)
+    except (TypeError, ValueError):
+        d = dt.date.today()
+    y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+    return dt.datetime(y, m, PROPERTY["due_day"], 10, tzinfo=dt.timezone(dt.timedelta(hours=5, minutes=30))).isoformat()
+
+
+def autopay_url(row):
+    return f"{PUBLIC_URL}/autopay/{row['token']}"
+
+
+async def setup_autopay(t, form):
+    if t["rent"] > 15000:
+        raise ToolError("UPI AutoPay supports this property only up to ₹15,000 per debit")
+    sub_id, token = f"rent_{t['id']}_{uuid.uuid4().hex[:10]}", secrets.token_urlsafe(24)
+    first_charge = next_rent_charge(form.get("move_in"))
+    q("insert into autopay(tenant_id,subscription_id,token,first_charge) values(?,?,?,?)",
+      (t["id"], sub_id, token, first_charge))
+    if MOCK_CF:
+        q("update autopay set status='setup_failed' where tenant_id=?", (t["id"],))
+        raise ToolError("Cashfree Subscriptions are not configured")
+    try:
+        j = await cf("POST", "/pg/subscriptions", "2026-01-01", idempotency_key=str(uuid.uuid4()), json={
+            "subscription_id": sub_id,
+            "customer_details": {"customer_name": t["name"], "customer_email": form["email"], "customer_phone": t["phone"]},
+            "plan_details": {"plan_name": f"{PROPERTY['name']} rent"[:40], "plan_type": "PERIODIC",
+                             "plan_currency": "INR", "plan_amount": t["rent"], "plan_max_amount": t["rent"],
+                             "plan_intervals": 1, "plan_interval_type": "MONTH",
+                             "plan_note": f"Monthly rent for Room {t['room']}"},
+            "authorization_details": {"authorization_amount": 1, "authorization_amount_refund": True,
+                                      "payment_methods": ["upi"]},
+            "subscription_meta": {"return_url": f"{PUBLIC_URL}/autopay/{token}/return",
+                                  "notification_channel": ["EMAIL", "SMS"]},
+            "subscription_first_charge_time": first_charge,
+            "subscription_tags": {"tenant_id": str(t["id"]), "room": t["room"],
+                                  "psp_note": f"{PROPERTY['name']} monthly rent"}})
+        if not j.get("subscription_session_id"):
+            raise ToolError("Cashfree did not return an AutoPay session")
+        q("update autopay set cf_subscription_id=?, session_id=?, status=? where tenant_id=?",
+          (j.get("cf_subscription_id"), j["subscription_session_id"],
+           str(j.get("subscription_status") or "initialized").lower(), t["id"]))
+    except Exception as e:
+        q("update autopay set status='setup_failed' where tenant_id=?", (t["id"],))
+        if isinstance(e, ToolError):
+            raise
+        raise ToolError("Cashfree AutoPay is temporarily unavailable")
+    row = q("select * from autopay where tenant_id=?", (t["id"],))[0]
+    await send_to_tenant(t, f"Set up UPI AutoPay for your monthly rent of ₹{t['rent']} due on the {PROPERTY['due_day']}th. "
+                              f"Approve the mandate securely with Cashfree: {autopay_url(row)}", "", [])
+    return row
+
+
 def ob_reserved(room):  # beds held for people who are mid-onboarding
     return q("select count(*) n from onboarding where room=? and status in ('invited','link_sent','submitted')", (room,))[0]["n"]
 
@@ -1831,6 +1886,112 @@ def activity():
             "audit": q("select ts,actor,action,payload from audit_log order by id desc limit 100")}
 
 
+# ---------- Cashfree UPI AutoPay ----------
+def autopay_row(token):
+    rows = q("select a.*,t.name,t.phone,t.room,t.rent from autopay a join tenants t on t.id=a.tenant_id where a.token=?", (token,))
+    if not rows:
+        raise HTTPException(404, "AutoPay link not found")
+    return rows[0]
+
+
+@app.get("/autopay/{token}", response_class=HTMLResponse)
+def autopay_page(token: str):
+    a = autopay_row(token)
+    active = a["status"] == "active"
+    if not active and not a["session_id"]:
+        raise HTTPException(409, "AutoPay setup is unavailable. Please ask the owner for a new link.")
+    mode = "sandbox" if "sandbox" in CF_BASE else "production"
+    session = json.dumps(a["session_id"])
+    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rent AutoPay</title><script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
+<style>:root{{--bg:#faf9f6;--card:#fff;--ink:#1a1a1a;--mut:#666;--line:#e8e6df;--pri:#1f5e55}}
+body{{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}}main{{max-width:440px;margin:48px auto;padding:0 18px}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px}}h1{{font-size:26px;margin:0 0 6px}}p{{color:var(--mut)}}
+dl{{display:grid;grid-template-columns:1fr auto;gap:10px;margin:24px 0}}dd{{margin:0;font-weight:600}}button{{width:100%;border:0;border-radius:12px;padding:14px;background:var(--pri);color:white;font:inherit;font-weight:600;cursor:pointer}}button:disabled{{opacity:.6}}</style></head>
+<body><main><div class="card"><h1>{"AutoPay is active" if active else "Set up rent AutoPay"}</h1>
+<p>{"Your monthly rent mandate is ready." if active else "Approve a secure UPI mandate with Cashfree. A refundable ₹1 authorisation may appear during setup."}</p>
+<dl><dt>Tenant</dt><dd>{html.escape(a["name"])}</dd><dt>Room</dt><dd>{html.escape(a["room"])}</dd>
+<dt>Monthly rent</dt><dd>₹{a["rent"]:,}</dd><dt>Due every month</dt><dd>{PROPERTY["due_day"]}th</dd></dl>
+{'' if active else '<button id="approve">Continue to Cashfree</button><p id="error"></p>'}</div></main>
+<script>const b=document.getElementById("approve");if(b) b.onclick=async()=>{{b.disabled=true;b.textContent="Opening Cashfree…";
+const result=await Cashfree({{mode:{json.dumps(mode)}}}).subscriptionsCheckout({{subsSessionId:{session},redirectTarget:"_self"}});
+if(result?.error){{document.getElementById("error").textContent=result.error.message||"Could not open Cashfree. Please try again.";b.disabled=false;b.textContent="Continue to Cashfree"}}}};</script>
+</body></html>"""
+
+
+@app.api_route("/autopay/{token}/return", methods=["GET", "POST"], response_class=HTMLResponse)
+async def autopay_return(token: str):
+    a = autopay_row(token)
+    try:
+        j = await cf("GET", f"/pg/subscriptions/{a['subscription_id']}", "2026-01-01")
+        status = str(j.get("subscription_status") or a["status"]).lower()
+        q("update autopay set status=?, cf_subscription_id=coalesce(?,cf_subscription_id) where id=?",
+          (status, j.get("cf_subscription_id"), a["id"]))
+    except ToolError:
+        status = a["status"]
+    title = "AutoPay active" if status == "active" else "Mandate submitted"
+    detail = ("Your monthly rent will be collected automatically." if status == "active"
+              else "Cashfree is confirming your mandate. You can close this page; we will update you on WhatsApp.")
+    return f"<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>{title}</title><body style='font:16px/1.5 system-ui;max-width:440px;margin:64px auto;padding:0 18px'><h1>{title}</h1><p>{detail}</p>"
+
+
+@app.post("/webhooks/cashfree/subscription")
+async def webhook_subscription(request: Request, background_tasks: BackgroundTasks):
+    raw = await request.body()
+    verify_cashfree_webhook(request, raw, CF_SECRET)
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid JSON")
+    event, data = str(body.get("type") or "").upper(), body.get("data") or {}
+    wrapper = data.get("subscription_status_webhook") or {}
+    details = data.get("subscription_details") or wrapper.get("subscription_details") or {}
+    sub_id = data.get("subscription_id") or details.get("subscription_id")
+    rows = q("select * from autopay where subscription_id=?", (sub_id,))
+    if not rows:
+        return {"ok": True, "ignored": True}
+    a = rows[0]
+    auth = data.get("authorization_details") or wrapper.get("authorization_details") or {}
+    status = str(details.get("subscription_status") or "").lower()
+    auth_status = str(auth.get("authorization_status") or auth.get("authorizationStatus") or "").lower()
+    if event == "SUBSCRIPTION_AUTH_STATUS" and (auth_status == "failed" or str(data.get("payment_status") or "").lower() == "failed"):
+        q("update autopay set status='failed' where id=? and status!='active'", (a["id"],))
+    elif auth_status == "active":
+        q("update autopay set status='active' where id=?", (a["id"],))
+    elif status:
+        q("update autopay set status=? where id=?", (status, a["id"]))
+    if event in ("SUBSCRIPTION_PAYMENT_FAILED", "SUBSCRIPTION_PAYMENT_CANCELLED"):
+        q("update autopay set last_payment_status=? where id=?", (event.removeprefix("SUBSCRIPTION_PAYMENT_").lower(), a["id"]))
+    if event == "SUBSCRIPTION_PAYMENT_SUCCESS" and str(data.get("payment_type") or "").upper() == "CHARGE":
+        if str(data.get("payment_currency") or "INR").upper() != "INR":
+            raise HTTPException(400, "unexpected currency")
+        try:
+            raw_amount = float(data["payment_amount"])
+            amount = int(raw_amount)
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, "invalid payment amount")
+        if amount <= 0 or raw_amount != amount:
+            raise HTTPException(400, "invalid payment amount")
+        payment_id = str(data.get("cf_payment_id") or data.get("payment_id") or "")
+        if not payment_id:
+            raise HTTPException(400, "missing payment id")
+        scheduled = str(data.get("payment_schedule_date") or "")
+        mon = scheduled[:7] if re.fullmatch(r"\d{4}-\d{2}.*", scheduled) else month()
+        tenant = tenant_row(a["tenant_id"])
+        q("insert or ignore into ledger(tenant_id,month,due) values(?,?,?)", (tenant["id"], mon, tenant["rent"]))
+        link_id = f"autopay_{a['subscription_id']}_{payment_id}"
+        q("insert or ignore into payments(tenant_id,link_id,amount,month,url,method) values(?,?,?,?,?,'autopay')",
+          (tenant["id"], link_id, amount, mon, autopay_url(a)))
+        q("update autopay set status='active', last_payment_status='success' where id=?", (a["id"],))
+        audit("cashfree", "autopay_payment", {"tenant_id": tenant["id"], "subscription_id": sub_id,
+                                              "payment_id": payment_id, "amount": amount, "month": mon})
+        return await apply_payment(link_id, amount, payment_id, background_tasks)
+    current = q("select status from autopay where id=?", (a["id"],))[0]["status"]
+    audit("cashfree", "autopay_status", {"tenant_id": a["tenant_id"], "subscription_id": sub_id,
+                                         "event": event, "status": current})
+    return {"ok": True, "status": current}
+
+
 # ---------- onboarding endpoints ----------
 @app.post("/onboarding/start")
 async def onboarding_start(request: Request):
@@ -1852,7 +2013,8 @@ def onboard_page(token: str):
 def onboard_prefill(token: str):
     ob = ob_live(token)
     return {"property": PROPERTY["name"], "address": PROPERTY_ADDRESS, "name": ob["name"], "phone": ob["phone"], "whatsapp": ob["whatsapp"] or "",
-            "room": ob["room"], "sharing": ob["sharing"], "rent": ob["rent"], "deposit": ob["deposit"], "status": ob["status"]}
+            "room": ob["room"], "sharing": ob["sharing"], "rent": ob["rent"], "deposit": ob["deposit"],
+            "due_day": PROPERTY["due_day"], "status": ob["status"]}
 
 
 REQUIRED = ["name", "phone", "email", "dob", "gender", "occupation", "org_name", "org_role", "primary_language",
@@ -1883,8 +2045,9 @@ async def onboard_submit(token: str, request: Request, bg: BackgroundTasks):
         raise HTTPException(400, "Please accept the declaration to continue.")
     aadhaar = await save_upload(form.get("aadhaar"), (".jpg", ".png", ".pdf"), ob["id"], "Aadhaar card")
     photo = await save_upload(form.get("photo"), (".jpg", ".png"), ob["id"], "Photo")
+    f["autopay"] = "yes" if f.get("autopay") == "yes" else "no"
     keep = ["name", "phone", "whatsapp", "email", "dob", "gender", "occupation", "org_name", "org_role", "org_location", "primary_language",
-            "secondary_language", "address", "emergency_name", "emergency_phone", "emergency_relation", "move_in", "food", "health_notes", "vehicle"]
+            "secondary_language", "address", "emergency_name", "emergency_phone", "emergency_relation", "move_in", "food", "health_notes", "vehicle", "autopay"]
     q("update onboarding set status='submitted', whatsapp=?, form_json=?, aadhaar_file=?, photo_file=?, submitted_at=datetime('now','localtime') where id=?",
       (f["whatsapp"], json.dumps({k: f.get(k, "") for k in keep}, ensure_ascii=False), aadhaar, photo, ob["id"]))
     audit("tenant", "onboarding_submitted", {"id": ob["id"], "name": f["name"]})
@@ -1902,7 +2065,12 @@ async def onboard_submit(token: str, request: Request, bg: BackgroundTasks):
 
 @app.get("/onboarding")
 def onboarding_list():
-    return q("select id,name,phone,room,sharing,status,call_outcome,created,submitted_at,tenant_id from onboarding order by id desc")
+    rows = q("select o.id,o.name,o.phone,o.room,o.sharing,o.status,o.call_outcome,o.created,o.submitted_at,o.tenant_id,o.form_json,a.status autopay_status "
+             "from onboarding o left join autopay a on a.tenant_id=o.tenant_id order by o.id desc")
+    for row in rows:
+        requested = json.loads(row.pop("form_json") or "{}").get("autopay") == "yes"
+        row["autopay_status"] = row["autopay_status"] or ("requested" if requested else "not_requested")
+    return rows
 
 
 @app.get("/onboarding/{oid}")
@@ -1911,10 +2079,11 @@ def onboarding_get(oid: int):
     if not r:
         raise HTTPException(404, "unknown onboarding")
     ob = r[0]
+    autopay = next(iter(q("select status,first_charge,last_payment_status from autopay where tenant_id=?", (ob["tenant_id"],))), None)
     return {**{k: ob[k] for k in ("id", "name", "phone", "room", "sharing", "rent", "deposit", "status", "call_outcome", "whatsapp",
                                   "created", "submitted_at", "tenant_id", "call_language")},
             "form": json.loads(ob["form_json"] or "{}"), "has_aadhaar": bool(ob["aadhaar_file"]), "has_photo": bool(ob["photo_file"]),
-            "link": ob_url(ob)}
+            "link": ob_url(ob), "autopay": autopay}
 
 
 @app.get("/onboarding/{oid}/file/{kind}")
@@ -1957,7 +2126,14 @@ async def onboarding_approve(oid: int):
     audit("owner", "onboarding_approved", {"id": oid, "tenant_id": res["tenant_id"]})
     t = tenant_row(res["tenant_id"])
     await send_to_tenant(t, res["welcome_text"], "", [])
-    return {"tenant_id": res["tenant_id"]}
+    autopay_status = "not_requested"
+    if form.get("autopay") == "yes":
+        try:
+            autopay_status = (await setup_autopay(t, form))["status"]
+        except ToolError as e:
+            autopay_status = "setup_failed"
+            audit("cashfree", "autopay_setup_failed", {"tenant_id": t["id"], "error": str(e)})
+    return {"tenant_id": res["tenant_id"], "autopay_status": autopay_status}
 
 
 @app.post("/webhooks/sarvam/onboarding")

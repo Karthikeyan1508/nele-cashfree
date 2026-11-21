@@ -36,6 +36,7 @@ Rules enforced **in backend, not the LLM**:
 |---|---|
 | `POST /webhooks/cashfree/payment` | Payment-link paid/partial. Verify signature (`x-webhook-signature` + `x-webhook-timestamp`), update `ledger`, then emit event below. Idempotent on `link_id`/`cf_payment_id`. |
 | `POST /webhooks/cashfree/payout` | Transfer status → update `payouts`. |
+| `POST /webhooks/cashfree/subscription` | AutoPay mandate and recurring-charge status. A successful `CHARGE` updates `payments` and `ledger`; authorization ₹1 events are ignored. |
 
 Expose via ngrok; register URL in Cashfree sandbox dashboard.
 
@@ -67,7 +68,8 @@ Always send a `{text}` fallback path so the demo survives mic/Saaras failure.
 
 `owners(id,name,phone)` · `properties(id,owner_id,name,beds,due_day)` · `tenants(id,property_id,name,phone,room,rent,deposit,language,status)` ·
 `ledger(id,tenant_id,month,due,paid,status[due|partial|paid|promised],promise_date)` · `payments(id,tenant_id,link_id,cf_payment_id,amount,status)` ·
-`payees(id,name,account_ref,verified)` · `payouts(id,payee_id,amount,reason,status,cf_transfer_id,confirmed_at)` · `tickets(id,tenant_id,issue,status)` · `audit_log(...)`
+`payees(id,name,account_ref,verified)` · `payouts(id,payee_id,amount,reason,status,cf_transfer_id,confirmed_at)` ·
+`autopay(id,tenant_id,subscription_id,status,first_charge,last_payment_status)` · `tickets(id,tenant_id,issue,status)` · `audit_log(...)`
 
 ## Seed (P5)
 

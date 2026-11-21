@@ -36,6 +36,9 @@ textarea{min-height:84px;resize:vertical}
 .file img{max-width:110px;border-radius:10px;margin-top:10px;display:block}
 .check{display:flex;gap:10px;align-items:flex-start;font-size:14px;font-weight:400;margin-top:0}
 .check input{width:auto;margin-top:4px;accent-color:var(--pri)}
+.autopay{background:var(--soft);border-color:transparent}.autopay-head{display:flex;gap:12px;align-items:flex-start;margin-bottom:16px}
+.autopay-head svg{flex:none;color:var(--pri)}.autopay h2{margin-bottom:4px}.autopay p{color:var(--mut);font-size:14px;margin:0}
+.autopay .check{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px}
 button{width:100%;font:inherit;font-weight:600;background:var(--pri);color:var(--pri-ink);border:0;border-radius:12px;padding:14px;cursor:pointer}
 button:disabled{opacity:.6}
 .err{color:var(--err);margin:12px 0 0;font-size:14px}
@@ -111,6 +114,13 @@ function render(j){
     <label>Vehicle number <span class="opt">(optional)</span></label><input name="vehicle">
    </div>
 
+   <div class="card autopay">
+    <div class="autopay-head"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 7h-9a4 4 0 0 0-4 4v1"/><path d="m17 4 3 3-3 3"/><path d="M4 17h9a4 4 0 0 0 4-4v-1"/><path d="m7 20-3-3 3-3"/></svg>
+    <div><h2>Monthly rent AutoPay</h2><p>Optional. After the owner approves your stay, we will send a secure Cashfree link to authorise UPI AutoPay.</p></div></div>
+    <label class="check"><input type="checkbox" name="autopay" value="yes">Yes, send me the AutoPay setup link for ${inr(j.rent)} on the ${j.due_day}th of each month.</label>
+    <p style="margin-top:10px">Your deposit and first rent remain a separate one-time payment. AutoPay starts with the following rent cycle and can only activate after you approve the mandate.</p>
+   </div>
+
    <div class="card"><h2>Documents</h2>
     <label>Aadhaar card <span class="opt">(photo or PDF, up to 5 MB)</span></label>
     <div class="file"><input type="file" name="aadhaar" accept="image/jpeg,image/png,application/pdf" required><small>Front and back in one file if possible.</small></div>
@@ -133,10 +143,11 @@ function render(j){
   f.onsubmit=async e=>{
     e.preventDefault();$('#err').textContent='';
     if(!f.checkValidity()){f.reportValidity();return}
+    const wantsAutopay=f.autopay.checked;
     $('#go').disabled=true;$('#go').textContent='Submitting…';
     const r=await fetch('/onboard-api/'+token,{method:'POST',body:new FormData(f)});
     const d=await r.json().catch(()=>({}));
-    if(r.ok){$('#app').innerHTML=`<div class="done"><div class="tick">✅</div><h1>Thank you!</h1><p class="sub">Your details are received. The owner will confirm your room shortly, and you will get a message on WhatsApp.</p>${PG.address?`<div class="card" style="text-align:left;margin-top:24px"><h2>Your present address</h2><p style="margin:0">You can use the address of our PG as your present address:</p><p style="margin:8px 0 0;font-weight:600">${esc(PG.property)}<br>${esc(PG.address)}</p></div>`:''}</div>`;scrollTo(0,0)}
+    if(r.ok){$('#app').innerHTML=`<div class="done"><div class="tick">✅</div><h1>Thank you!</h1><p class="sub">Your details are received. The owner will confirm your room shortly, and you will get a message on WhatsApp.${wantsAutopay?' Your secure AutoPay setup link will follow after approval.':''}</p>${PG.address?`<div class="card" style="text-align:left;margin-top:24px"><h2>Your present address</h2><p style="margin:0">You can use the address of our PG as your present address:</p><p style="margin:8px 0 0;font-weight:600">${esc(PG.property)}<br>${esc(PG.address)}</p></div>`:''}</div>`;scrollTo(0,0)}
     else{$('#err').textContent=d.detail||'Something went wrong. Please try again.';$('#go').disabled=false;$('#go').textContent='Submit details'}
   };
 }
