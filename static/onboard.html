@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Move-in details</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#faf9f6;--card:#fff;--ink:#1a1a1a;--mut:#6b6b70;--line:#e8e6df;--pri:#1f5e55;--pri-ink:#fff;--soft:#e8f2ef;--err:#b3261e}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--card:#1e1e22;--ink:#f1efe9;--mut:#9a98a0;--line:#34343a;--pri:#7fd1c0;--pri-ink:#0d2a25;--soft:#1c2e2b;--err:#f2b8b5}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 Geist,system-ui,sans-serif;-webkit-font-smoothing:antialiased;letter-spacing:-.006em}
+main{max-width:640px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:26px;letter-spacing:-.02em;margin:4px 0 4px}
+h2{font-size:15px;margin:0 0 14px;font-weight:600}
+.sub{color:var(--mut);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px}
+.room{background:var(--soft);border-color:transparent;display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.room b{display:block;font-size:18px}.room span{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+label{display:block;font-size:14px;font-weight:500;margin:14px 0 6px}label:first-child,h2+label{margin-top:0}
+.row,.choice,#wa{margin-top:14px}h2+.row,h2+.choice{margin-top:0}
+.opt{color:var(--mut);font-weight:400}
+input,select,textarea{width:100%;font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px 12px;outline:none}
+input:focus,select:focus,textarea:focus{border-color:var(--pri);box-shadow:0 0 0 3px color-mix(in srgb,var(--pri) 20%,transparent)}
+input[readonly]{background:var(--bg)}
+textarea{min-height:84px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:520px){.row,.room{grid-template-columns:1fr 1fr}}
+.choice{display:flex;gap:10px;flex-wrap:wrap}
+.choice label{display:flex;align-items:center;gap:8px;margin:0;border:1px solid var(--line);border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:500}
+.choice input{width:auto;margin:0;accent-color:var(--pri)}
+.choice label:has(input:checked){border-color:var(--pri);background:var(--soft)}
+.file{border:1.5px dashed var(--line);border-radius:12px;padding:14px}
+.file small{display:block;color:var(--mut);margin-top:6px}
+.file img{max-width:110px;border-radius:10px;margin-top:10px;display:block}
+.check{display:flex;gap:10px;align-items:flex-start;font-size:14px;font-weight:400;margin-top:0}
+.check input{width:auto;margin-top:4px;accent-color:var(--pri)}
+button{width:100%;font:inherit;font-weight:600;background:var(--pri);color:var(--pri-ink);border:0;border-radius:12px;padding:14px;cursor:pointer}
+button:disabled{opacity:.6}
+.err{color:var(--err);margin:12px 0 0;font-size:14px}
+.hide{display:none}
+.done{text-align:center;padding:48px 16px}.done .tick{font-size:48px}
+</style>
+</head>
+<body>
+<main id="app"><p class="sub">Loading…</p></main>
+<script>
+let PG={};
+const $=s=>document.querySelector(s), token=location.pathname.split('/').pop();
+const LANGS=['English','Hindi','Kannada','Telugu','Tamil','Malayalam','Marathi','Bengali','Gujarati','Punjabi','Odia','Urdu','Other'];
+const inr=n=>'₹'+Number(n).toLocaleString('en-IN');
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const opts=(l,none)=>(none?'<option value="">None</option>':'<option value="" disabled selected>Select</option>')+l.map(x=>`<option>${x}</option>`).join('');
+
+fetch('/onboard-api/'+token).then(async r=>{
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) return msg('Link problem', j.detail||'This link is not valid.');
+  if(j.status!=='invited'&&j.status!=='link_sent') return msg('Already submitted','Your details were received. The owner will confirm your room shortly.');
+  PG=j; render(j);
+});
+
+function msg(t,d){$('#app').innerHTML=`<div class="done"><div class="tick">${t==='Already submitted'?'✅':'⚠️'}</div><h1>${t}</h1><p class="sub">${esc(d)}</p></div>`}
+
+function render(j){
+  $('#app').innerHTML=`
+  <p class="sub" style="margin-bottom:0">${esc(j.property)}</p>
+  <h1>Welcome, ${esc(j.name)}</h1>
+  <p class="sub">Please fill in your move-in details. It takes about 5 minutes.</p>
+  <div class="card room">
+    <div><span>Room</span><b>${esc(j.room)}</b></div>
+    <div><span>Sharing</span><b>${j.sharing}-sharing</b></div>
+    <div><span>Rent / month</span><b>${inr(j.rent)}</b></div>
+    <div><span>Deposit</span><b>${inr(j.deposit)}</b></div>
+  </div>
+  <form id="f" novalidate>
+   <div class="card"><h2>About you</h2>
+    <label>Full name</label><input name="name" value="${esc(j.name)}" required>
+    <div class="row"><div><label>Phone number</label><input name="phone" inputmode="numeric" maxlength="10" value="${esc(j.phone)}" required></div>
+    <div><label>Date of birth</label><input name="dob" type="date" required></div></div>
+    <label>Is this phone number on WhatsApp?</label>
+    <div class="choice"><label><input type="radio" name="whatsapp_same" value="yes" ${j.whatsapp?'':'checked'}>Yes</label><label><input type="radio" name="whatsapp_same" value="no" ${j.whatsapp?'checked':''}>No, use another number</label></div>
+    <div id="wa" class="${j.whatsapp?'':'hide'}"><label>WhatsApp number</label><input name="whatsapp" inputmode="numeric" maxlength="10" value="${esc(j.whatsapp)}"></div>
+    <div class="row"><div><label>Email address</label><input name="email" type="email" required></div>
+    <div><label>Gender</label><select name="gender" required>${opts(['Female','Male','Other'])}</select></div></div>
+   </div>
+
+   <div class="card"><h2>Study or work</h2>
+    <div class="choice"><label><input type="radio" name="occupation" value="student" checked>Student</label><label><input type="radio" name="occupation" value="working">Working</label></div>
+    <label id="l1">College / university</label><input name="org_name" required>
+    <div class="row"><div><label id="l2">Course and year</label><input name="org_role" required></div>
+    <div><label id="l3">College city</label><input name="org_location"></div></div>
+   </div>
+
+   <div class="card"><h2>Languages</h2>
+    <div class="row"><div><label>Primary language</label><select name="primary_language" required>${opts(LANGS)}</select></div>
+    <div><label>Secondary language <span class="opt">(optional)</span></label><select name="secondary_language">${opts(LANGS,true)}</select></div></div>
+   </div>
+
+   <div class="card"><h2>Home address and emergency contact</h2>
+    <label>Permanent address <span class="opt">(your home address)</span></label><textarea name="address" required></textarea>
+    <label>Emergency contact name</label><input name="emergency_name" required>
+    <div class="row"><div><label>Relation</label><input name="emergency_relation" placeholder="Father, mother…" required></div>
+    <div><label>Their phone</label><input name="emergency_phone" inputmode="numeric" maxlength="10" required></div></div>
+   </div>
+
+   <div class="card"><h2>Your stay</h2>
+    <div class="row"><div><label>Expected move-in date</label><input name="move_in" type="date" required></div>
+    <div><label>Food preference</label><select name="food" required>${opts(['Vegetarian','Non-vegetarian','Eggetarian'])}</select></div></div>
+    <label>Medical conditions or allergies <span class="opt">(optional)</span></label><input name="health_notes">
+    <label>Vehicle number <span class="opt">(optional)</span></label><input name="vehicle">
+   </div>
+
+   <div class="card"><h2>Documents</h2>
+    <label>Aadhaar card <span class="opt">(photo or PDF, up to 5 MB)</span></label>
+    <div class="file"><input type="file" name="aadhaar" accept="image/jpeg,image/png,application/pdf" required><small>Front and back in one file if possible.</small></div>
+    <label>Passport size photo <span class="opt">(JPG or PNG)</span></label>
+    <div class="file"><input type="file" name="photo" id="photo" accept="image/jpeg,image/png" required><img id="prev" class="hide" alt=""></div>
+   </div>
+
+   <div class="card"><label class="check"><input type="checkbox" name="consent" required>I confirm the details above are correct. I agree that the owner may keep my details and documents only to manage my stay, as per the house rules.</label></div>
+   <button id="go" type="submit">Submit details</button>
+   <p class="err" id="err"></p>
+  </form>`;
+
+  const f=$('#f');
+  f.querySelectorAll('[name=whatsapp_same]').forEach(r=>r.onchange=()=>$('#wa').classList.toggle('hide',f.whatsapp_same.value==='yes'));
+  f.querySelectorAll('[name=occupation]').forEach(r=>r.onchange=()=>{
+    const s=f.occupation.value==='student';
+    $('#l1').textContent=s?'College / university':'Company name';$('#l2').textContent=s?'Course and year':'Designation';$('#l3').textContent=s?'College city':'Work location';
+  });
+  $('#photo').onchange=e=>{const x=e.target.files[0];if(x){$('#prev').src=URL.createObjectURL(x);$('#prev').classList.remove('hide')}};
+  f.onsubmit=async e=>{
+    e.preventDefault();$('#err').textContent='';
+    if(!f.checkValidity()){f.reportValidity();return}
+    $('#go').disabled=true;$('#go').textContent='Submitting…';
+    const r=await fetch('/onboard-api/'+token,{method:'POST',body:new FormData(f)});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok){$('#app').innerHTML=`<div class="done"><div class="tick">✅</div><h1>Thank you!</h1><p class="sub">Your details are received. The owner will confirm your room shortly, and you will get a message on WhatsApp.</p>${PG.address?`<div class="card" style="text-align:left;margin-top:24px"><h2>Your present address</h2><p style="margin:0">You can use the address of our PG as your present address:</p><p style="margin:8px 0 0;font-weight:600">${esc(PG.property)}<br>${esc(PG.address)}</p></div>`:''}</div>`;scrollTo(0,0)}
+    else{$('#err').textContent=d.detail||'Something went wrong. Please try again.';$('#go').disabled=false;$('#go').textContent='Submit details'}
+  };
+}
+</script>
+</body>
+</html>

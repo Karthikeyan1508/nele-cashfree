@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kiraya Mitra</title>
+<style>
+:root{--bg:#f4f1ea;--card:#fff;--ink:#1d1d1f;--mut:#6b6b70;--line:#e4e0d6;--acc:#b4531a;--ok:#1c8a4a;--okbg:#d9f3e3;--warn:#b7791f}
+@media (prefers-color-scheme:dark){:root{--bg:#17161a;--card:#222126;--ink:#f1efe9;--mut:#9a98a0;--line:#37353d;--acc:#f0925a;--ok:#4cc982;--okbg:#17402a;--warn:#e0a84a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,sans-serif}
+header{padding:14px 16px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+header h1{margin:0;font-size:20px}header span{color:var(--mut);font-size:13px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:0 16px 16px;max-width:1200px;margin:auto}
+@media(max-width:800px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.card h2{margin:0;font-size:16px}
+.log{height:240px;overflow:auto;display:flex;flex-direction:column;gap:6px;border:1px solid var(--line);border-radius:10px;padding:8px}
+.m{max-width:88%;padding:7px 10px;border-radius:10px;background:var(--bg)}
+.m.me{align-self:flex-end;background:var(--acc);color:#fff}
+.m small{display:block;color:var(--mut);margin-top:2px}.m.me small{color:#ffe}
+.row{display:flex;gap:6px}.row input,.row select{flex:1;min-width:0}
+input,select,button{font:inherit;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+button{cursor:pointer}button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+button.rec{background:#c0392b;border-color:#c0392b;color:#fff}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.chips button{font-size:13px;padding:5px 9px;border-radius:99px}
+table{width:100%;border-collapse:collapse}td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
+tr.flash{animation:fl 2.5s}@keyframes fl{0%,60%{background:var(--okbg)}100%{background:transparent}}
+.tag{padding:2px 8px;border-radius:99px;font-size:12px;background:var(--bg)}
+.tag.paid{background:var(--okbg);color:var(--ok)}.tag.partial,.tag.promised{color:var(--warn)}
+#toast{position:fixed;left:50%;top:14px;transform:translateX(-50%);background:var(--ok);color:#fff;padding:12px 18px;border-radius:12px;font-weight:600;display:none;z-index:9}
+.pay{border:2px solid var(--warn);border-radius:10px;padding:10px;display:none;gap:8px;flex-direction:column}
+.mut{color:var(--mut);font-size:13px}
+</style>
+</head>
+<body>
+<div id="toast"></div>
+<header><h1>Kiraya Mitra</h1><span>Kiraya bolo, kiraya aao</span><span id="mode"></span><a href="/report" target="_blank" style="margin-left:auto">Monthly report</a></header>
+<div class="grid">
+  <section class="card" id="owner">
+    <h2>Owner (speaks Kannada)</h2>
+    <div class="log" id="olog"></div>
+    <div class="pay" id="paybox"><b id="payread"></b>
+      <div class="row"><input id="pin" type="password" inputmode="numeric" placeholder="PIN"><button class="p" id="payok">Confirm</button><button id="paycancel">Cancel</button></div></div>
+    <div class="chips" id="ochips"></div>
+    <div class="row"><button id="omic">🎤</button><input id="otxt" placeholder="Speak or type… (Kannada / English)"><button class="p" id="osend">Send</button></div>
+  </section>
+  <section class="card" id="tenant">
+    <h2>Tenant <select id="tsel"></select> <span class="mut" id="tlang"></span></h2>
+    <div class="log" id="tlog"></div>
+    <div class="chips" id="tchips"></div>
+    <div class="row"><button id="tmic">🎤</button><input id="ttxt" placeholder="Speak or type in your language…"><button class="p" id="tsend">Send</button></div>
+  </section>
+  <section class="card" style="grid-column:1/-1">
+    <h2>Live ledger <span class="mut" id="sum"></span></h2>
+    <table><thead><tr><th>Room</th><th>Tenant</th><th>Lang</th><th>Due</th><th>Paid</th><th>Status</th><th>Promise</th></tr></thead><tbody id="ledger"></tbody></table>
+  </section>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const LC={kn:'kn-IN',hi:'hi-IN',bn:'bn-IN',ml:'ml-IN',en:'en-IN'};
+let tenants=[],pendingId=null,last=0;
+
+function speak(text,lang,url){
+  if(url){new Audio(url).play().catch(()=>{});return}
+  if(!window.speechSynthesis)return;
+  const u=new SpeechSynthesisUtterance(text);u.lang=LC[lang]||'en-IN';speechSynthesis.cancel();speechSynthesis.speak(u);
+}
+function bubble(log,html,me){const d=document.createElement('div');d.className='m'+(me?' me':'');d.innerHTML=html;$(log).appendChild(d);$(log).scrollTop=1e9}
+
+async function send(role,{text,blob}){
+  const log=role==='owner'?'olog':'tlog';
+  const fd=new FormData();
+  if(blob)fd.append('audio',blob,'rec.webm');else fd.append('text',text);
+  if(role==='tenant')fd.append('tenant_id',$('tsel').value);
+  if(text)bubble(log,esc(text),true);
+  const r=await fetch('/voice/'+role,{method:'POST',body:fd});
+  if(!r.ok){bubble(log,'⚠ '+esc((await r.json()).detail||r.status));return}
+  const j=await r.json();
+  if(blob)bubble(log,esc(j.transcript),true);
+  let h=esc(j.reply_text);
+  if(j.reply_text!==j.reply_en)h+=`<small>${esc(j.reply_en)}</small>`;
+  for(const c of j.tool_calls){
+    const res=c.result;
+    for(const s of res.sent||[])h+=`<small>📨 ${esc(s.name)} (${s.lang}): ${esc(s.text)} ${s.voice_note_url?`<a href="${s.voice_note_url}" target="_blank">🔊</a>`:''}</small>`;
+    if(res.welcome_text)h+=`<small>${esc(res.welcome_text)}</small>`;
+  }
+  for(const u of j.links)h+=`<br><a href="${u}" target="_blank"><button class="p">Open payment link</button></a>`;
+  bubble(log,h);speak(j.reply_text,j.lang,j.reply_audio_url);
+  if(j.pending_payout)showPay(j.pending_payout);
+  refresh();
+}
+
+function showPay(p){pendingId=p.payout_id;$('payread').textContent='Confirm: '+p.readback;$('paybox').style.display='flex';$('pin').value='';$('pin').focus()}
+$('payok').onclick=async()=>{
+  const r=await fetch('/payouts/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payout_id:pendingId,pin:$('pin').value})});
+  const j=await r.json();
+  if(!r.ok){bubble('olog','⚠ '+esc(j.detail));return}
+  $('paybox').style.display='none';bubble('olog','✅ Payout '+esc(j.status));
+};
+$('paycancel').onclick=async()=>{await fetch('/payouts/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payout_id:pendingId})});$('paybox').style.display='none'};
+
+function mic(btn,role){
+  let mr,chunks;
+  btn.onclick=async()=>{
+    if(mr&&mr.state==='recording'){mr.stop();return}
+    try{
+      const s=await navigator.mediaDevices.getUserMedia({audio:true});chunks=[];mr=new MediaRecorder(s);
+      mr.ondataavailable=e=>chunks.push(e.data);
+      mr.onstop=()=>{s.getTracks().forEach(t=>t.stop());btn.classList.remove('rec');btn.textContent='🎤';send(role,{blob:new Blob(chunks,{type:mr.mimeType})})};
+      mr.start();btn.classList.add('rec');btn.textContent='⏹';
+    }catch(e){bubble(role==='owner'?'olog':'tlog','⚠ mic unavailable: '+esc(e.message))}
+  };
+}
+function wire(role,inp,btn,chips,list){
+  const go=()=>{const t=$(inp).value.trim();if(t){$(inp).value='';send(role,{text:t})}};
+  $(btn).onclick=go;$(inp).onkeydown=e=>{if(e.key==='Enter')go()};
+  for(const c of list){const b=document.createElement('button');b.textContent=c;b.onclick=()=>send(role,{text:c});$(chips).appendChild(b)}
+}
+wire('owner','otxt','osend','ochips',['Yaaru innu kottilla?','Ellarigu reminder kalsi','Electrician Raju ge 800 kodi','Ee thingala lekka?']);
+wire('tenant','ttxt','tsend','tchips',['Pay now','Half now, half Friday','Salary on the 10th','Geyser not working']);
+mic($('omic'),'owner');mic($('tmic'),'tenant');
+
+async function refresh(){
+  const [d,s]=await Promise.all([fetch('/dues').then(r=>r.json()),fetch('/summary').then(r=>r.json())]);
+  const old={};document.querySelectorAll('#ledger tr').forEach(tr=>old[tr.dataset.id]=tr.dataset.paid);
+  $('ledger').innerHTML=d.dues.map(x=>`<tr data-id="${x.tenant_id}" data-paid="${x.paid}" class="${old[x.tenant_id]!==undefined&&old[x.tenant_id]!=x.paid?'flash':''}"><td>${esc(x.room)}</td><td>${esc(x.name)}</td><td>${x.language}</td><td>₹${x.due}</td><td>₹${x.paid}</td><td><span class="tag ${x.status}">${x.status}</span></td><td>${x.promise_date||''}</td></tr>`).join('');
+  $('sum').textContent=`collected ₹${s.collected} · pending ₹${s.pending} · repairs ₹${s.repairs_spent} · vacant ${s.beds_vacant}`;
+}
+async function poll(){
+  try{
+    const j=await fetch('/events?after='+last).then(r=>r.json());last=j.last;
+    for(const e of j.events){
+      if(e.announce){
+        if(e.type==='payment_received'){const t=$('toast');t.textContent=e.announce.text;t.style.display='block';setTimeout(()=>t.style.display='none',4000)}
+        bubble('olog',`🔔 ${esc(e.announce.text)}`);
+        const a=await fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:e.announce.text,lang:'kn'})}).then(r=>r.json()).catch(()=>({}));
+        speak(e.announce.text,'kn',a.audio_url);
+      }
+      if(e.type==='promise_logged')bubble('olog',`📅 ${esc(e.name)} promised ₹${e.amount} on ${e.date}`);
+    }
+    if(j.events.length)refresh();
+  }catch(e){}
+  setTimeout(poll,1500);
+}
+(async()=>{
+  const c=await fetch('/config').then(r=>r.json());
+  $('mode').textContent=`Sarvam: ${c.sarvam?'live':'offline rules'} · Cashfree: ${c.mock_cashfree?'mock':'sandbox'}`;
+  tenants=await fetch('/tenants').then(r=>r.json());
+  $('tsel').innerHTML=tenants.map(t=>`<option value="${t.id}" data-l="${t.language}">${esc(t.name)} · ${esc(t.room)}</option>`).join('');
+  const lang=()=>$('tlang').textContent='('+$('tsel').selectedOptions[0].dataset.l+')';$('tsel').onchange=lang;
+  $('tsel').value=tenants.find(t=>t.room==='204').id;lang();
+  last=(await fetch('/events').then(r=>r.json())).last;
+  refresh();poll();
+})();
+</script>
+</body>
+</html>

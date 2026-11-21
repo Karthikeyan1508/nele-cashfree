@@ -1,0 +1,5 @@
+kiraya.db
+static/audio/
+.env
+__pycache__/
+uploads/
