@@ -12,7 +12,8 @@ Voice agent for PG owners: collect rent, chase late payers, pay vendors, settle 
 # backend (http://localhost:8000)
 pip install -r requirements.txt
 python -m uvicorn app:app --port 8000
-# The Next.js dashboard is not part of this repository.
+# dashboard (http://localhost:3000, proxies /api to the backend)
+cd dashboard && npm install && npm run dev
 ```
 Meta webhook: `PUBLIC_URL/webhooks/whatsapp`. Twilio uses `PUBLIC_URL/calls/*` (set by the app per call). Schedule `POST /cron/reminders` to call late tenants automatically.
 
