@@ -58,6 +58,8 @@ Backend returns `announce.text` already translated; P1 exposes `POST /tts` for t
 | Endpoint | Request | Response |
 |---|---|---|
 | `POST /voice/owner` | multipart `audio` (or JSON `{text}` fallback) | `{transcript, reply_text, reply_audio_url, tool_calls:[...]}` — reply in Kannada |
+| `POST /voice/owner/call` | — | Places a realtime call from the dedicated Sarvam owner agent; `{status, attempt_id}` |
+| `POST /voice-tools/{name}` | tool JSON + `X-Voice-Key` | Protected owner tool endpoint used during the realtime call; payout confirmation is deliberately unavailable |
 | `POST /voice/tenant` | multipart `audio`/`{text}` + `tenant_id` | `{transcript, reply_text, reply_audio_url}` — reply in tenant's language; handles "pay now / half now / salary on 10th" by calling `create_rent_link` / `log_promise` |
 | `POST /remind` | `{tenant_ids:[...]}` or `{all_late:true}` | `{sent:[{tenant_id, lang, voice_note_url, link_url}]}` — Mayura translation + Bulbul voice note + payment link |
 | `POST /tts` | `{text, lang}` | `{audio_url}` |

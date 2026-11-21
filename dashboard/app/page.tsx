@@ -2,7 +2,7 @@
 import { useState } from "react"
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts"
 import { toast } from "sonner"
-import { AlertCircle, BedDouble, CalendarDays, HandCoins, Landmark, PhoneCall, Wallet, Wrench } from "lucide-react"
+import { AlertCircle, BedDouble, CalendarDays, HandCoins, Landmark, PhoneCall, PhoneIncoming, Wallet, Wrench } from "lucide-react"
 import { PageHeader } from "@/components/page-header"
 import { PersonAvatar } from "@/components/person-avatar"
 import { Pick } from "@/components/pick"
@@ -14,7 +14,7 @@ import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } f
 import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { LedgerRow, inr, monthLabel, post, useApi } from "@/lib/api"
+import { Config, LedgerRow, inr, monthLabel, post, useApi } from "@/lib/api"
 
 type Overview = {
   summary: { collected: number; pending: number; collection_rate: number; repairs_spent: number; beds_vacant: number; deposits_held: number; wallet_balance: number | null; wallet_status: "live" | "unavailable"; month: string }
@@ -32,7 +32,9 @@ const chart = {
 
 export default function Overview() {
   const [month, setMonth] = useState("")
+  const [callingOwner, setCallingOwner] = useState(false)
   const q = month ? `?month=${month}` : ""
+  const cfg = useApi<Config & { owner_voice: boolean }>("/config", 30000)
   const ov = useApi<Overview>(`/overview${q}`, 5000)
   const led = useApi<{ months: string[]; rows: LedgerRow[] }>(`/ledger${q}`, 5000)
   const s = ov.data?.summary
@@ -49,6 +51,19 @@ export default function Overview() {
     }
   }
 
+  async function callMyAgent() {
+    setCallingOwner(true)
+    const id = toast.loading("Calling your phone…")
+    try {
+      await post("/voice/owner/call")
+      toast.success("The realtime agent is calling you now", { id })
+    } catch (e) {
+      toast.error(String(e), { id })
+    } finally {
+      setCallingOwner(false)
+    }
+  }
+
   const kpis = s && ov.data ? [
     { label: "Collected", value: inr(s.collected), hint: `${s.collection_rate}% of rent due`, icon: Wallet, tone: "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300" },
     { label: "Pending", value: inr(s.pending), hint: `${late.length} ${late.length === 1 ? "tenant" : "tenants"} yet to pay`, icon: CalendarDays, tone: "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300" },
@@ -62,6 +77,10 @@ export default function Overview() {
     <>
       <PageHeader title="Overview" description="This month's rent at a glance">
         <Pick icon={CalendarDays} value={month || s?.month || ""} onChange={setMonth} options={(led.data?.months ?? []).map((m) => ({ value: m, label: monthLabel(m) }))} />
+        <Button variant="outline" className="h-9 rounded-xl" onClick={callMyAgent} disabled={!cfg.data?.owner_voice || callingOwner}
+          title={cfg.data?.owner_voice ? "Start a realtime voice call" : "Configure the dedicated Sarvam owner agent first"}>
+          <PhoneIncoming /> {callingOwner ? "Calling…" : "Call my agent"}
+        </Button>
         <Button className="h-9 rounded-xl" onClick={callAll} disabled={!late.length}><PhoneCall /> Call all late tenants</Button>
       </PageHeader>
 

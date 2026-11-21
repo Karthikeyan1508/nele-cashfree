@@ -45,6 +45,9 @@ SV_KEY, SV_ORG, SV_WS = os.getenv("SARVAM_VOICE_API_KEY", ""), os.getenv("SARVAM
 SV_APP, SV_VER = os.getenv("SARVAM_VOICE_APP_ID", ""), int(os.getenv("SARVAM_VOICE_APP_VERSION", "1") or 1)
 SV_CONN, SV_NUM = os.getenv("SARVAM_VOICE_CONNECTION_ID", ""), os.getenv("SARVAM_VOICE_NUMBER", "")
 VOICE = all([SV_KEY, SV_ORG, SV_WS, SV_APP, SV_CONN, SV_NUM])  # Sarvam Voice Agents (Samvaad) places the calls when fully configured
+SV_OWNER_APP, SV_OWNER_VER = os.getenv("SARVAM_OWNER_APP_ID", ""), int(os.getenv("SARVAM_OWNER_APP_VERSION", "1") or 1)
+SV_TOOL_SECRET = os.getenv("SARVAM_VOICE_TOOL_SECRET", "")
+OWNER_VOICE = all([SV_KEY, SV_ORG, SV_WS, SV_OWNER_APP, SV_CONN, SV_NUM, SV_TOOL_SECRET])
 LANG_NAMES = {"kn": "Kannada", "hi": "Hindi", "bn": "Bengali", "ml": "Malayalam", "en": "English"}
 SV_ONB_APP, SV_ONB_VER = os.getenv("SARVAM_ONBOARD_APP_ID", ""), int(os.getenv("SARVAM_ONBOARD_APP_VERSION", "1") or 1)
 WA_ONBOARD_TEMPLATE = os.getenv("WA_ONBOARD_TEMPLATE", "")  # body vars: name, form link
@@ -1403,11 +1406,19 @@ def index():
 @app.get("/config")
 def config():
     return {"mock_cashfree": MOCK_CF, "sarvam": bool(SK), "whatsapp": bool(WA_TOKEN), "twilio": bool(TW_SID), "voice": VOICE, "property": PROPERTY,
-            "owner_phone": last10(OWNER_PHONE)}
+            "owner_voice": OWNER_VOICE, "owner_phone": last10(OWNER_PHONE)}
 
 
 @app.post("/tools/{name}")
 async def tool(name: str, request: Request):
+    return await call_tool(name, await request.json() if await request.body() else {}, "owner")
+
+
+@app.post("/voice-tools/{name}")
+async def voice_tool(name: str, request: Request):
+    supplied = request.headers.get("x-voice-key") or request.query_params.get("k", "")
+    if not OWNER_VOICE or not hmac.compare_digest(supplied, SV_TOOL_SECRET):
+        raise HTTPException(403, "bad voice tool key")
     return await call_tool(name, await request.json() if await request.body() else {}, "owner")
 
 
@@ -1464,6 +1475,19 @@ async def payouts_cancel(request: Request):
 @app.post("/voice/owner")
 async def voice_owner(audio: UploadFile | None = File(None), text: str = Form("")):
     return await voice("owner", None, audio, text)
+
+
+@app.post("/voice/owner/call")
+async def call_owner_agent():
+    if not OWNER_VOICE:
+        raise HTTPException(503, "Create a dedicated Sarvam owner agent and set SARVAM_OWNER_APP_ID first")
+    status, attempt = await samvaad_outbound(SV_OWNER_APP, SV_OWNER_VER, {
+        "property_name": PROPERTY["name"], "current_date": dt.date.today().isoformat(), **pg_facts()
+    }, "kn", OWNER_PHONE, "/webhooks/sarvam/owner", {"role": "owner"})
+    if status == "failed":
+        raise HTTPException(502, "Sarvam could not place the owner call")
+    audit("owner", "owner_voice_call", {"status": status, "attempt_id": attempt})
+    return {"status": status, "attempt_id": attempt}
 
 
 @app.post("/voice/tenant")
@@ -1779,6 +1803,18 @@ async def sarvam_call_hook(request: Request):
                "amount": int(v["amount"]) if str(v.get("amount", "")).isdigit() else None}
     q("update calls set turn=3 where id=?", (cid,))
     await tenant_turn(cid, said, pre, dialogue)
+    return {"ok": True}
+
+
+@app.post("/webhooks/sarvam/owner")
+async def sarvam_owner_hook(request: Request):
+    """Record the owner agent's completed realtime call; tools execute during the call."""
+    if not hmac.compare_digest(request.query_params.get("k", ""), voice_key()):
+        raise HTTPException(403, "bad key")
+    d = await request.json()
+    dialogue, _ = dialogue_of(d)
+    audit("sarvam", "owner_voice_completed", {"status": d.get("status"), "interaction_id": d.get("interaction_id"),
+                                                "transcript": dialogue[:4000]})
     return {"ok": True}
 
 

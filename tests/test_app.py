@@ -5,7 +5,8 @@ os.environ.update(DB_PATH=os.path.join(tempfile.mkdtemp(), "t.db"), SARVAM_API_K
                   CASHFREE_VERIFY_CLIENT_ID="", CASHFREE_VERIFY_CLIENT_SECRET="", TWILIO_SID="", TWILIO_TOKEN="",
                   WHATSAPP_TOKEN="", OWNER_PHONE="9800000000", PAYOUT_PIN="1234", DAILY_PAYOUT_LIMIT="1000",
                   # blank so tests never place real calls through Sarvam, whatever .env holds
-                  SARVAM_VOICE_API_KEY="", SARVAM_ORG_ID="", SARVAM_WORKSPACE_ID="", SARVAM_VOICE_APP_ID="", SARVAM_VOICE_CONNECTION_ID="", SARVAM_VOICE_NUMBER="", SARVAM_ONBOARD_APP_ID="")
+                  SARVAM_VOICE_API_KEY="", SARVAM_ORG_ID="", SARVAM_WORKSPACE_ID="", SARVAM_VOICE_APP_ID="", SARVAM_VOICE_CONNECTION_ID="", SARVAM_VOICE_NUMBER="", SARVAM_ONBOARD_APP_ID="",
+                  SARVAM_OWNER_APP_ID="", SARVAM_VOICE_TOOL_SECRET="")
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 import pytest
@@ -357,6 +358,34 @@ def test_sarvam_voice_webhooks(c):
     assert c.post(f"/webhooks/sarvam/inbound?k={k}", json=body).json() == {"ok": True}
     assert c.post(f"/webhooks/sarvam/inbound?k={k}", json=body).json().get("ignored")
     assert any(v["name"] == "Keshava Karthik" and "water leak" in v["issue"] for v in c.get("/activity").json()["tickets"])
+
+
+def test_owner_realtime_voice_call_and_tools(c, monkeypatch):
+    assert c.post("/voice/owner/call").status_code == 503
+    captured = {}
+
+    async def fake_outbound(app_id, app_version, variables, language, phone, hook, metadata):
+        captured.update(app_id=app_id, app_version=app_version, variables=variables, language=language,
+                        phone=phone, hook=hook, metadata=metadata)
+        return "ringing", "owner_attempt_1"
+
+    monkeypatch.setattr(A, "OWNER_VOICE", True)
+    monkeypatch.setattr(A, "SV_OWNER_APP", "owner-agent")
+    monkeypatch.setattr(A, "SV_OWNER_VER", 3)
+    monkeypatch.setattr(A, "samvaad_outbound", fake_outbound)
+    r = c.post("/voice/owner/call")
+    assert r.json() == {"status": "ringing", "attempt_id": "owner_attempt_1"}
+    assert captured["app_id"] == "owner-agent" and captured["hook"] == "/webhooks/sarvam/owner"
+    assert captured["phone"] == A.OWNER_PHONE and captured["language"] == "kn"
+
+    monkeypatch.setattr(A, "SV_TOOL_SECRET", "voice-secret")
+    assert c.post("/voice-tools/get_dues", json={}).status_code == 403
+    tool = c.post("/voice-tools/get_dues", json={}, headers={"X-Voice-Key": "voice-secret"})
+    assert tool.status_code == 200 and "dues" in tool.json()
+    assert c.post("/webhooks/sarvam/owner?k=bad", json={}).status_code == 403
+    hook = c.post(f"/webhooks/sarvam/owner?k={A.voice_key()}", json={"status": "connected", "interaction_id": "owner_attempt_1",
+                  "interaction_transcript": [{"role": "agent", "en_text": "How can I help?"}, {"role": "user", "en_text": "Rent summary"}]})
+    assert hook.json() == {"ok": True}
 
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
