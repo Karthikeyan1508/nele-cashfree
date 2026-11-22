@@ -3,7 +3,7 @@ import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useState } from "react"
 import { toast } from "sonner"
-import { Eye, MoreHorizontal, PhoneCall, Plus, Search, Wallet } from "lucide-react"
+import { Eye, LogOut, MoreHorizontal, PhoneCall, Plus, Search, Wallet } from "lucide-react"
 import { PageHeader } from "@/components/page-header"
 import { PersonAvatar } from "@/components/person-avatar"
 import { Pick } from "@/components/pick"
@@ -144,6 +144,8 @@ export default function Tenants() {
                         <DropdownMenuSeparator />
                         <DropdownMenuItem className="rounded-lg py-2" disabled={t.rent_status === "paid"} onClick={() => call(t)}><PhoneCall /> Call about rent</DropdownMenuItem>
                         <DropdownMenuItem className="rounded-lg py-2" disabled={t.rent_status === "paid"} onClick={() => setRec(t)}><Wallet /> Record payment</DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem className="rounded-lg py-2" onClick={() => router.push(`/offboarding?start=${t.id}`)}><LogOut /> Start move-out</DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </TableCell>

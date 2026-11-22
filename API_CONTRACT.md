@@ -1,4 +1,4 @@
-# Kiraya Mitra — Starter API Contract
+# Nele — Starter API Contract
 
 > **Implementation note:** tools are served by generic `POST /tools/{name}` (same JSON args as below); events are polled via `GET /events?after=N` (not SSE); payout confirm is UI-only `POST /payouts/confirm`, not an LLM tool. See `app.py`.
 

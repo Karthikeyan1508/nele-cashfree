@@ -1,7 +1,7 @@
 "use client"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { Activity, BedDouble, Building2, CalendarDays, LayoutDashboard, MessageCircle, UserPlus, Users } from "lucide-react"
+import { Activity, BedDouble, Building2, CalendarDays, LayoutDashboard, LogOut, MessageCircle, PhoneIncoming, UserPlus, Users } from "lucide-react"
 import { PersonAvatar } from "@/components/person-avatar"
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader,
@@ -15,6 +15,8 @@ const GROUPS = [
   { label: "Property", items: [
     { href: "/tenants", label: "Tenants", icon: Users },
     { href: "/onboarding", label: "Onboarding", icon: UserPlus },
+    { href: "/enquiries", label: "Enquiries", icon: PhoneIncoming },
+    { href: "/offboarding", label: "Move-outs", icon: LogOut },
     { href: "/rooms", label: "Rooms", icon: BedDouble },
     { href: "/ledger", label: "Rent ledger", icon: CalendarDays },
   ] },
@@ -41,7 +43,11 @@ export function AppSidebar() {
   const { data: late } = useApi<{ dues: unknown[] }>("/dues?all=0", 10000)
   const { data: onb } = useApi<{ status: string }[]>("/onboarding", 10000)
   const waiting = onb?.filter((o) => o.status === "submitted").length ?? 0
-  const badge = (href: string) => (href === "/tenants" && late?.dues.length ? String(late.dues.length) : href === "/onboarding" && waiting ? String(waiting) : null)
+  const { data: off } = useApi<{ status: string }[]>("/offboarding", 10000)
+  const moveOuts = off?.filter((o) => ["accepted", "disputed"].includes(o.status)).length ?? 0
+  const { data: enq } = useApi<{ status: string }[]>("/enquiries", 10000)
+  const newEnq = enq?.filter((e) => e.status === "new").length ?? 0
+  const badge = (href: string) => (href === "/enquiries" && newEnq ? String(newEnq) : href === "/tenants" && late?.dues.length ? String(late.dues.length) : href === "/onboarding" && waiting ? String(waiting) : href === "/offboarding" && moveOuts ? String(moveOuts) : null)
 
   return (
     <Sidebar collapsible="icon">
@@ -49,7 +55,7 @@ export function AppSidebar() {
         <div className="flex items-center gap-3">
           <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm"><Building2 className="size-5" /></div>
           <div className="leading-tight group-data-[collapsible=icon]:hidden">
-            <div className="font-semibold tracking-tight">Kiraya Mitra</div>
+            <div className="font-semibold tracking-tight">Nele</div>
             <div className="text-xs text-muted-foreground">Sai Residency · 36 beds</div>
           </div>
         </div>

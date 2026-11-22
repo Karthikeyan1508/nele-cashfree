@@ -63,7 +63,7 @@ export default function WhatsApp() {
       <div className="grid gap-5 lg:grid-cols-3">
         <Card className="lg:col-span-2">
           <CardHeader>
-            <CardTitle>Owner chat · Kiraya Mitra</CardTitle>
+            <CardTitle>Owner chat · Nele</CardTitle>
             <CardDescription>
               {cfg?.whatsapp ? "Live WhatsApp number connected. This window is a simulator and does not message your phone." : "WhatsApp not connected (no token): simulator mode."}
               {" "}Speak or type in Kannada/English. The agent answers with a voice note.

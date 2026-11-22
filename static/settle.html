@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Deposit settlement</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#faf9f6;--card:#fff;--ink:#1a1a1a;--mut:#6b6b70;--line:#e8e6df;--pri:#1f5e55;--pri-ink:#fff;--soft:#e8f2ef;--err:#b3261e;--warn:#fff4e0}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--card:#1e1e22;--ink:#f1efe9;--mut:#9a98a0;--line:#34343a;--pri:#7fd1c0;--pri-ink:#0d2a25;--soft:#1c2e2b;--err:#f2b8b5;--warn:#2d2616}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 Geist,system-ui,sans-serif;-webkit-font-smoothing:antialiased;letter-spacing:-.006em}
+main{max-width:560px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:26px;letter-spacing:-.02em;margin:4px 0}h2{font-size:15px;margin:0 0 14px;font-weight:600}
+.sub{color:var(--mut);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px}
+table{width:100%;border-collapse:collapse}td{padding:9px 0;border-bottom:1px solid var(--line)}td:last-child{text-align:right;font-weight:500}
+tr:last-child td{border-bottom:0}
+.total td{font-size:18px;font-weight:600;padding-top:14px}.total td:last-child{color:var(--pri)}
+.owe td:last-child{color:var(--err)}
+.note{background:var(--warn);border-radius:12px;padding:12px 14px;font-size:14px;margin-bottom:16px}
+label{display:block;font-size:14px;font-weight:500;margin:14px 0 6px}label:first-child{margin-top:0}
+input,textarea{width:100%;font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px 12px;outline:none}
+input:focus,textarea:focus{border-color:var(--pri);box-shadow:0 0 0 3px color-mix(in srgb,var(--pri) 20%,transparent)}
+textarea{min-height:90px}
+button{width:100%;font:inherit;font-weight:600;border:0;border-radius:12px;padding:14px;cursor:pointer;background:var(--pri);color:var(--pri-ink)}
+button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line);margin-top:10px}
+button:disabled{opacity:.6}.err{color:var(--err);font-size:14px;margin:12px 0 0}.hide{display:none}
+.done{text-align:center;padding:48px 16px}.done .tick{font-size:48px}
+</style>
+</head>
+<body>
+<main id="app"><p class="sub">Loading…</p></main>
+<script>
+const $=s=>document.querySelector(s), token=location.pathname.split('/').pop();
+const inr=n=>'₹'+Number(n).toLocaleString('en-IN');
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function msg(icon,t,d){$('#app').innerHTML=`<div class="done"><div class="tick">${icon}</div><h1>${t}</h1><p class="sub">${esc(d)}</p></div>`}
+
+fetch('/settle-api/'+token).then(async r=>{
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) return msg('⚠️','Link problem',j.detail||'This link is not valid.');
+  if(j.status==='accepted') return msg('✅','Already confirmed','You have confirmed this settlement. The owner will send your refund shortly.');
+  if(j.status==='disputed') return msg('📝','Sent to the owner','Your objection has been sent. The owner will review it and send you a new settlement.');
+  if(j.status!=='proposed') return msg('ℹ️','Settlement closed','This settlement is no longer open. Please contact the owner.');
+  render(j);
+});
+
+function render(j){
+  const owes=j.shortfall>0&&!j.refund;
+  $('#app').innerHTML=`
+  <p class="sub" style="margin-bottom:0">${esc(j.property)}</p>
+  <h1>Deposit settlement</h1>
+  <p class="sub">${esc(j.name)} · Room ${esc(j.room)} · moving out on ${esc(j.move_out_date)}</p>
+  <div class="card"><table class="${owes?'owe':''}">
+    <tr><td>Deposit paid</td><td>${inr(j.deposit)}</td></tr>
+    ${j.deductions.map(d=>`<tr><td>− ${esc(d.reason)}</td><td>− ${inr(d.amount)}</td></tr>`).join('')}
+    ${j.unpaid_dues?`<tr><td>− Unpaid rent</td><td>− ${inr(j.unpaid_dues)}</td></tr>`:''}
+    <tr class="total"><td>${owes?'Balance you still owe':'Refund to you'}</td><td>${inr(owes?j.shortfall:j.refund)}</td></tr>
+  </table></div>
+  ${owes?'<div class="note">The deductions and unpaid rent are more than your deposit. The owner will contact you about the balance.</div>':''}
+  <div id="acceptBox" class="card">
+    <h2>${j.requires_bank?'Where should we send your refund?':'Confirm this settlement'}</h2>
+    ${j.requires_bank?`
+    <label>Account holder name</label><input id="holder" autocomplete="name">
+    <label>Account number</label><input id="acc" inputmode="numeric" autocomplete="off">
+    <label>Confirm account number</label><input id="acc2" inputmode="numeric" autocomplete="off">
+    <label>IFSC code</label><input id="ifsc" autocapitalize="characters" maxlength="11" autocomplete="off">`:''}
+    <div style="height:16px"></div>
+    <button id="ok">${j.requires_bank?'Confirm and submit bank details':'Confirm settlement'}</button>
+    <button id="no" class="ghost">I do not agree</button>
+    <p class="err" id="err"></p>
+  </div>
+  <div id="disputeBox" class="card hide">
+    <h2>What do you disagree with?</h2>
+    <textarea id="note" placeholder="For example: the painting charge, or I already paid last month's rent"></textarea>
+    <div style="height:16px"></div>
+    <button id="send">Send to the owner</button>
+    <button id="back" class="ghost">Go back</button>
+    <p class="err" id="err2"></p>
+  </div>`;
+  const post=async(body,errEl,btn)=>{
+    errEl.textContent='';btn.disabled=true;
+    const r=await fetch('/settle-api/'+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json().catch(()=>({}));
+    btn.disabled=false;
+    if(!r.ok){errEl.textContent=d.detail||'Something went wrong. Please try again.';return null}
+    return d;
+  };
+  $('#ok').onclick=async()=>{
+    if(j.requires_bank){
+      if($('#acc').value.replace(/\D/g,'')!==$('#acc2').value.replace(/\D/g,'')){$('#err').textContent='The two account numbers do not match.';return}
+    }
+    const d=await post({action:'accept',account_holder:j.requires_bank?$('#holder').value:'',account_number:j.requires_bank?$('#acc').value:'',ifsc:j.requires_bank?$('#ifsc').value:''},$('#err'),$('#ok'));
+    if(d)msg('✅','Thank you',j.requires_bank?'Your bank details are saved. The owner will send your refund shortly, and you will get a message on WhatsApp.':'The settlement is confirmed.');
+  };
+  $('#no').onclick=()=>{$('#acceptBox').classList.add('hide');$('#disputeBox').classList.remove('hide')};
+  $('#back').onclick=()=>{$('#disputeBox').classList.add('hide');$('#acceptBox').classList.remove('hide')};
+  $('#send').onclick=async()=>{
+    const d=await post({action:'dispute',note:$('#note').value},$('#err2'),$('#send'));
+    if(d)msg('📝','Sent to the owner','Your objection has been sent. The owner will review it and send you a new settlement.');
+  };
+}
+</script>
+</body>
+</html>

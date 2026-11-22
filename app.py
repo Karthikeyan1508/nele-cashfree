@@ -1,12 +1,12 @@
-"""Kiraya Mitra backend: voice agent for PG owners. Sarvam (voice/LLM) + Cashfree (money).
+"""Nele backend: voice agent for PG owners. Sarvam (voice/LLM) + Cashfree (money).
 Runs fully in MOCK mode with no keys (fake payment page, canned translations) so the demo never dies."""
-import asyncio, random, base64, datetime as dt, hashlib, hmac, html, json, os, re, sqlite3, uuid
+import asyncio, time, difflib, random, base64, datetime as dt, hashlib, hmac, html, json, os, re, sqlite3, uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).parent
@@ -25,11 +25,13 @@ CF_VERIFY_SECRET = os.getenv("CASHFREE_VERIFY_CLIENT_SECRET") or CF_SECRET
 CF_BASE = os.getenv("CASHFREE_BASE", "https://sandbox.cashfree.com")
 CF_PAYOUT_BASE = os.getenv("CASHFREE_PAYOUT_BASE", "https://payout-gamma.cashfree.com" if "sandbox" in CF_BASE else "https://payout-api.cashfree.com")
 MOCK_CF = not (CF_ID and CF_SECRET)
-MOCK_PAYOUT = not (CF_PAYOUT_ID and CF_PAYOUT_SECRET)
+MOCK_PAYOUT = os.getenv("CASHFREE_PAYOUT_MOCK") == "1" or not (CF_PAYOUT_ID and CF_PAYOUT_SECRET)  # CASHFREE_PAYOUT_MOCK=1 simulates transfers for a demo
 MOCK_VERIFY = not (CF_VERIFY_ID and CF_VERIFY_SECRET)
 PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8000")
 PIN = os.getenv("PAYOUT_PIN", "1234")
 DAILY_LIMIT = int(os.getenv("DAILY_PAYOUT_LIMIT", "5000"))
+DEPOSIT_LIMIT = int(os.getenv("DEPOSIT_PAYOUT_LIMIT", "100000"))  # deposit refunds are large, so they get their own daily cap
+WA_SETTLE_TEMPLATE = os.getenv("WA_SETTLE_TEMPLATE", "")  # body vars: name, settlement link
 LLM = os.getenv("SARVAM_LLM_MODEL", "sarvam-105b")
 STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
 TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
@@ -74,11 +76,13 @@ create table if not exists calls(id integer primary key, tenant_id int, month te
 create table if not exists messages(id integer primary key, ts text default current_timestamp, phone text, role text, direction text, kind text, text text, audio_url text, channel text default 'whatsapp', wa_id text unique);
 create table if not exists promises(id integer primary key, tenant_id int, amount int, date text, reason text, ts text default current_timestamp);
 create table if not exists payees(id integer primary key, name text, account_no text, ifsc text, verified int default 0, bank_name text);
-create table if not exists payouts(id integer primary key, payee_id int, amount int, reason text, kind text default 'vendor', status text, cf_transfer_id text, day text, offboard_id int);
-create table if not exists offboards(id integer primary key, tenant_id int, deductions_json text default '[]', refund int, status text default 'awaiting_deductions', created text default current_timestamp);
+create table if not exists payouts(id integer primary key, payee_id int, amount int, reason text, kind text default 'vendor', status text, cf_transfer_id text, day text);
+create table if not exists tickets(id integer primary key, tenant_id int, issue text, status text default 'open', ts text default current_timestamp, caller text, ref text);
+create table if not exists offboarding(id integer primary key, tenant_id int, move_out_date text, reason text, status text default 'notice', deductions_json text default '[]', deposit int, token text unique, bank_name text, bank_account text, bank_ifsc text, payee_id int, payout_id int, dispute_note text, proposed_at text, responded_at text, completed_at text, expires text, created text default current_timestamp);
 create table if not exists autopay(id integer primary key, tenant_id int unique, subscription_id text unique, cf_subscription_id text, token text unique, session_id text, status text default 'requested', first_charge text, last_payment_status text, created text default current_timestamp);
-create table if not exists tickets(id integer primary key, tenant_id int, issue text, status text default 'open', ts text default current_timestamp);
 create table if not exists audit_log(id integer primary key, ts text, actor text, action text, payload text);
+create table if not exists enquiries(id integer primary key, phone text, name text, note text, first_msg text, source text default 'whatsapp', status text default 'new', msgs int default 1, created text default (datetime('now','localtime')), updated text default (datetime('now','localtime')));
+create table if not exists pending_actions(id integer primary key, kind text, arg text, summary text, status text default 'pending', created text default current_timestamp);
 create unique index if not exists payments_txn_id_uq on payments(txn_id) where txn_id is not null;
 create unique index if not exists payouts_transfer_id_uq on payouts(cf_transfer_id) where cf_transfer_id is not null;
 """
@@ -129,7 +133,7 @@ def audit(actor, action, payload):
 def seed():
     if q("select 1 from tenants"):
         return
-    # (name, phone, language, late payer). Only Karthikeyan, Dhananjayadas and Keshava Karthik are unpaid this month; the rest are paid demo tenants.
+    # (name, phone, language, late payer). Only Karthikeyan, Dhananjayadas and Atrinandan are unpaid this month; the rest are paid demo tenants.
     # Tenants are spread randomly over the rooms, never beyond a room's bed count (fixed seed, so the layout is stable).
     # Karthikeyan (the owner's own number) is a temporary extra late payer for testing; remove before the hackathon demo.
     rows = [("Karthikeyan", "9000000001", "en", 1), ("Dhananjayadas", "9000000002", "en", 1),
@@ -137,7 +141,7 @@ def seed():
             ("Arjun", "9800000104", "ml", 0), ("Meera", "9800000105", "ml", 0),
             ("Rohan", "9800000201", "hi", 0), ("Priya", "9800000202", "bn", 0),
             ("Vikram", "9800000203", "hi", 0), ("Joseph", "9800000204", "ml", 0),
-            ("Keshava Karthik", "9000000003", "en", 1)]
+            ("Atrinandan", "9000000005", "en", 1)]
     rng = random.Random(7)
     free = {room: v["sharing"] for room, v in ROOMS.items()}
     for n, p, lang, late in rows:
@@ -167,6 +171,20 @@ async def sarvam(path, **kw):
         r = await c.post("https://api.sarvam.ai" + path, headers={"api-subscription-key": SK}, **kw)
         r.raise_for_status()
         return r.json()
+
+
+async def english_name(name):
+    """Names are kept in English letters only: a name spoken or typed in Devanagari, Kannada and so on is transliterated, never translated."""
+    name = str(name or "").strip()
+    if not name or name.isascii() or not SK:
+        return name
+    try:
+        j = await sarvam("/transliterate", json={"input": name, "source_language_code": "auto", "target_language_code": "en-IN"})
+        out = str(j.get("transliterated_text") or "").strip()
+        return out.title() if out and out.isascii() else name
+    except Exception as e:
+        print("transliterate failed:", e)
+        return name
 
 
 async def tr(text, lang, fallback=None, src="en-IN"):
@@ -237,8 +255,8 @@ async def cashfree_wallet(force=False):
             raise ToolError(f"Cashfree Payouts auth failed ({r.status_code})")
         body = r.json()
         token = (body.get("data") or {}).get("token") or body.get("token")
-        if not token:
-            raise ToolError("Cashfree Payouts auth returned no token")
+        if not token:  # Cashfree answers 200 with status ERROR, e.g. "IP not whitelisted your current ip is ..."
+            raise ToolError("Cashfree Payouts: " + str(body.get("message") or "auth returned no token")[:200])
         PAYOUT_TOKEN.update(value=token, expires=now + 300)
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.get(CF_PAYOUT_BASE + "/payout/v1.2/getBalance", headers={
@@ -287,6 +305,17 @@ def find_tenant(tid=None, name=None):
     if tid:
         return tenant_row(int(tid))
     r = q("select * from tenants where status='active' and (lower(name)=lower(?) or room=?)", (name or "", name or ""))
+    if not r:  # spoken or mistyped names: "Dhananjay", "dhanajaya das"
+        key = re.sub(r"[^a-z]", "", (name or "").lower())
+        rows = q("select * from tenants where status='active'")
+        norm = {t["id"]: re.sub(r"[^a-z]", "", t["name"].lower()) for t in rows}
+        hits = [t for t in rows if key and len(key) >= 3 and (key in norm[t["id"]] or norm[t["id"]] in key or norm[t["id"]].startswith(key[:5]))]
+        if not hits:
+            close = difflib.get_close_matches(key, list(norm.values()), n=2, cutoff=0.7)
+            hits = [t for t in rows if norm[t["id"]] in close]
+        if len(hits) > 1:
+            raise ToolError(f"more than one tenant matches '{name}': " + ", ".join(t["name"] for t in hits))
+        r = hits
     if not r:
         raise ToolError(f"tenant '{name}' not found")
     return r[0]
@@ -312,6 +341,7 @@ async def make_link(t, amount, mon, purpose=None):
 
 
 async def t_add_tenant(name, phone, room, rent=None, deposit=None, language="hi", due_day=5):
+    name = await english_name(name)
     language = LANGS.get(str(language).lower(), language)
     if language not in LC:
         raise ToolError("language must be one of kn hi bn ml en")
@@ -398,7 +428,10 @@ async def t_record_payment(tenant_id, amount, method="cash"):
 
 
 async def tenant_detail(tid):
-    t = tenant_row(int(tid))
+    r = q("select * from tenants where id=?", (int(tid),))
+    if not r:
+        raise ToolError(f"tenant {tid} not found")
+    t = r[0]
     return {"tenant": t,
             "ledger": q("select month,due,paid,due-paid pending,status,promise_date from ledger where tenant_id=? order by month desc", (tid,)),
             "payments": q("select amount,paid,month,method,status,paid_ts,ts,txn_id,receipt_no from payments where tenant_id=? order by id desc", (tid,)),
@@ -427,9 +460,14 @@ async def t_verify_payee(name, account_no=None, ifsc=None):
     return {"payee_id": q.last, "verified": ok, "bank_name_match": bank_name}
 
 
-def spent_today():
-    return q("select coalesce(sum(amount),0) s from payouts where day=? and status in ('success','processing')",
-             (dt.date.today().isoformat(),))[0]["s"]
+def spent_today(kind="vendor"):
+    deposit = kind == "deposit"
+    return q("select coalesce(sum(amount),0) s from payouts where day=? and status in ('success','processing') and (kind='deposit')=?",
+             (dt.date.today().isoformat(), int(deposit)))[0]["s"]
+
+
+def payout_limit(kind):
+    return DEPOSIT_LIMIT if kind == "deposit" else DAILY_LIMIT
 
 
 async def t_prepare_payout(amount, reason="repair", payee_id=None, payee_name=None, kind="vendor"):
@@ -443,12 +481,81 @@ async def t_prepare_payout(amount, reason="repair", payee_id=None, payee_name=No
         raise ToolError(f"{p['name']} is not a verified payee; payout blocked")
     if amount <= 0:
         raise ToolError("amount must be positive")
-    if spent_today() + amount > DAILY_LIMIT:
-        raise ToolError(f"daily payout limit ₹{DAILY_LIMIT} would be exceeded")
+    if spent_today(kind) + amount > payout_limit(kind):
+        raise ToolError(f"daily payout limit ₹{payout_limit(kind)} would be exceeded")
     q("insert into payouts(payee_id,amount,reason,kind,status,day) values(?,?,?,?,'pending_confirm',?)",
       (p["id"], amount, reason, kind, dt.date.today().isoformat()))
     return {"payout_id": q.last, "readback": f"{p['name']}, ₹{amount}, {reason}", "requires_pin": True,
             "status": "pending_confirm"}
+
+
+async def apply_payout_status(transfer_id, status, code, event=""):
+    """One place that turns a Cashfree transfer state into our payout state; used by the webhook and by our own status checks."""
+    rows = q("select o.*, p.name from payouts o join payees p on p.id=o.payee_id where o.cf_transfer_id=?", (transfer_id,))
+    if not rows:
+        raise LookupError(transfer_id)
+    old = rows[0]
+    if status == "SUCCESS" and code == "COMPLETED":
+        new = "success"
+    elif "REVERSE" in event or status == "REVERSED":
+        new = "reversed"
+    elif "FAIL" in event or status in ("FAILED", "REJECTED"):
+        new = "failed"
+    else:
+        new = "processing"
+    if new == old["status"]:
+        return new
+    q("update payouts set status=? where id=?", (new, old["id"]))
+    refresh_wallet()
+    audit("cashfree", "payout_status", {"payout_id": old["id"], "transfer_id": transfer_id, "status": new})
+    if new == "success" and old["status"] != "success":
+        await publish("payout_done", f"Paid {old['name']} {old['amount']} rupees", payee=old["name"], amount=old["amount"], reason=old["reason"])
+        if old["kind"] == "deposit":
+            await finish_offboarding_after_refund(old, transfer_id)
+    return new
+
+
+async def check_payout(payout_id):
+    """Ask Cashfree where a transfer stands, for when its webhook is late or was never delivered."""
+    r = q("select cf_transfer_id, status from payouts where id=?", (payout_id,))
+    if not r or not r[0]["cf_transfer_id"] or MOCK_PAYOUT:
+        raise ToolError("no Cashfree transfer to check")
+    j = await cf("GET", "/payout/transfers", "2024-01-01", credentials=(CF_PAYOUT_ID, CF_PAYOUT_SECRET), params={"transfer_id": r[0]["cf_transfer_id"]})
+    return await apply_payout_status(r[0]["cf_transfer_id"], str(j.get("status", "")).upper(), str(j.get("status_code", "")).upper())
+
+
+async def watch_payout(payout_id):
+    for wait in (4, 8, 15, 30, 60, 120):  # banks usually settle sandbox transfers within seconds
+        await asyncio.sleep(wait)
+        try:
+            if await check_payout(payout_id) != "processing":
+                return
+        except Exception as e:
+            print("payout check failed:", e)
+
+
+async def ensure_beneficiary(o):
+    """Cashfree Payouts only pays a registered beneficiary: register the payee's bank account once, then reuse it."""
+    bid, creds = f"payee_{o['payee_id']}", (CF_PAYOUT_ID, CF_PAYOUT_SECRET)
+    try:
+        await cf("GET", "/payout/beneficiary", "2024-01-01", credentials=creds, params={"beneficiary_id": bid})
+        return bid
+    except ToolError as e:
+        if not str(e).startswith("Cashfree 404"):
+            raise
+    try:
+        await cf("POST", "/payout/beneficiary", "2024-01-01", credentials=creds, json={
+            "beneficiary_id": bid, "beneficiary_name": str(o["name"])[:100],
+            "beneficiary_instrument_details": {"bank_account_number": o["account_no"], "bank_ifsc": o["ifsc"]},
+            "beneficiary_contact_details": {"beneficiary_phone": last10(OWNER_PHONE)}})
+    except ToolError as e:
+        if not str(e).startswith("Cashfree 409"):
+            raise
+        # the same bank account is already registered under another id (a tenant who accepted twice): reuse it
+        j = await cf("GET", "/payout/beneficiary", "2024-01-01", credentials=creds,
+                     params={"bank_account_number": o["account_no"], "bank_ifsc": o["ifsc"]})
+        return j["beneficiary_id"]
+    return bid
 
 
 async def confirm_payout(payout_id, pin):
@@ -459,35 +566,39 @@ async def confirm_payout(payout_id, pin):
     if not r or r[0]["status"] != "pending_confirm":
         raise ToolError("payout not awaiting confirmation")
     o = r[0]
-    wallet_refund = o["kind"] == "deposit" and o.get("offboard_id")
-    if wallet_refund and o["amount"] > (await cashfree_wallet())["available_balance"]:
+    if o["kind"] == "deposit" and not MOCK_PAYOUT and o["amount"] > (await cashfree_wallet())["available_balance"]:
         raise ToolError("owner wallet balance is too low for this refund")
-    if not wallet_refund and spent_today() + o["amount"] > DAILY_LIMIT:
+    if spent_today(o["kind"]) + o["amount"] > payout_limit(o["kind"]):
         raise ToolError("daily payout limit exceeded")
-    tid = f"wallet_refund_{o['id']}" if wallet_refund else f"payout_{o['id']}_{uuid.uuid4().hex[:6]}"
+    tid = f"payout_{o['id']}_{uuid.uuid4().hex[:6]}"
     status = "success"
-    if not wallet_refund and not MOCK_PAYOUT:
+    if not MOCK_PAYOUT:
         q("update payouts set status='processing', cf_transfer_id=? where id=?", (tid, o["id"]))
         try:
+            bid = await ensure_beneficiary(o)
             j = await cf("POST", "/payout/transfers", "2024-01-01", idempotency_key=tid,
                          credentials=(CF_PAYOUT_ID, CF_PAYOUT_SECRET), json={
                 "transfer_id": tid, "transfer_amount": o["amount"], "transfer_currency": "INR", "transfer_mode": "imps",
-                "beneficiary_details": {"beneficiary_id": f"payee_{o['payee_id']}", "beneficiary_name": o["name"],
-                                        "beneficiary_instrument_details": {"bank_account_number": o["account_no"],
-                                                                           "bank_ifsc": o["ifsc"]}}})
+                "beneficiary_details": {"beneficiary_id": bid}})
             status = ("success" if str(j.get("status", "")).upper() == "SUCCESS" and
                       str(j.get("status_code", "")).upper() == "COMPLETED" else "processing")
         except ToolError as e:
+            rejected = re.match(r"Cashfree (4\d\d):", str(e))
+            if rejected:  # a 4xx means Cashfree refused it: no money moved, the owner can fix and retry
+                q("update payouts set status='pending_confirm', cf_transfer_id=null where id=?", (o["id"],))
+                audit("owner", "payout_rejected", {"payout_id": o["id"], "transfer_id": tid, "err": str(e)})
+                raise ToolError(f"Cashfree did not accept the transfer ({str(e)[9:130]}). Nothing was sent.")
             audit("owner", "payout_status_unknown", {"payout_id": o["id"], "transfer_id": tid, "err": str(e)})
             raise ToolError(f"payout submitted but status is unknown; reconcile transfer {tid}")
     q("update payouts set status=?, cf_transfer_id=? where id=?", (status, tid, o["id"]))
     refresh_wallet()
     audit("owner", "payout_confirmed", {"payout_id": o["id"], "amount": o["amount"], "to": o["name"], "status": status})
     if status == "success":
-        if wallet_refund:
-            q("update offboards set status='refunded' where id=?", (o["offboard_id"],))
-            q("update tenants set status='moved_out' where id=(select tenant_id from offboards where id=?)", (o["offboard_id"],))
         await publish("payout_done", f"Paid {o['name']} {o['amount']} rupees", payee=o["name"], amount=o["amount"], reason=o["reason"])
+        if o["kind"] == "deposit":  # a deposit refund closes the move-out
+            await finish_offboarding_after_refund(o, tid)
+    elif status == "processing" and not MOCK_PAYOUT:
+        asyncio.create_task(watch_payout(o["id"]))
     return {"status": status, "cashfree_transfer_id": tid}
 
 
@@ -507,57 +618,6 @@ async def t_settle_deposit(tenant_id, deductions=None, account_no=None, ifsc=Non
         else:
             out["error"] = "refund account not verified"
     return out
-
-
-async def t_start_offboarding(tenant_id):
-    t = tenant_row(int(tenant_id))
-    old = q("select * from offboards where tenant_id=? and status in ('awaiting_deductions','pending_refund') order by id desc limit 1", (t["id"],))
-    if old:
-        oid = old[0]["id"]
-    else:
-        q("insert into offboards(tenant_id) values(?)", (t["id"],))
-        oid = q.last
-    return {"offboard_id": oid, "tenant_id": t["id"], "tenant": t["name"], "deposit": t["deposit"],
-            "question": f"What deductions should I make from {t['name']}'s deposit of ₹{t['deposit']}? Say no deductions, or give each reason and amount."}
-
-
-async def t_finish_offboarding(tenant_id, deductions=None):
-    t = tenant_row(int(tenant_id))
-    ob = q("select * from offboards where tenant_id=? and status='awaiting_deductions' order by id desc limit 1", (t["id"],))
-    if not ob:
-        raise ToolError("start offboarding this tenant first")
-    deductions = deductions or []
-    clean = []
-    for d in deductions:
-        reason, amount = str(d.get("reason") or "deduction").strip()[:100], int(d.get("amount") or 0)
-        if amount < 0:
-            raise ToolError("deductions cannot be negative")
-        if amount:
-            clean.append({"reason": reason, "amount": amount})
-    deducted = sum(d["amount"] for d in clean)
-    if deducted > t["deposit"]:
-        raise ToolError("deductions cannot exceed the deposit")
-    dues = (await t_get_dues(t["id"], False))["dues"]
-    unpaid = max(dues[0]["pending"], 0) if dues else 0
-    refund = max(t["deposit"] - deducted - unpaid, 0)
-    balance = (await cashfree_wallet())["available_balance"]
-    if refund > balance:
-        raise ToolError(f"owner wallet has ₹{balance:g}, but the refund is ₹{refund}")
-    oid = ob[0]["id"]
-    q("update offboards set deductions_json=?, refund=?, status=? where id=?",
-      (json.dumps(clean), refund, "pending_refund" if refund else "complete", oid))
-    if not refund:
-        q("update tenants set status='moved_out' where id=?", (t["id"],))
-        return {"offboard_id": oid, "tenant": t["name"], "deposit": t["deposit"], "deductions": clean,
-                "unpaid_dues": unpaid, "refund": 0, "status": "moved_out", "wallet_balance": balance}
-    q("insert into payees(name,verified,bank_name) values(?,1,?)", (f"Tenant refund - {t['name']}", t["name"]))
-    payee_id = q.last
-    q("insert into payouts(payee_id,amount,reason,kind,status,day,offboard_id) values(?,?,?,'deposit','pending_confirm',?,?)",
-      (payee_id, refund, f"Deposit refund Room {t['room']}", dt.date.today().isoformat(), oid))
-    payout = {"payout_id": q.last, "readback": f"Refund {t['name']} ₹{refund} from owner wallet",
-              "requires_pin": True, "status": "pending_confirm"}
-    return {"offboard_id": oid, "tenant": t["name"], "deposit": t["deposit"], "deductions": clean,
-            "unpaid_dues": unpaid, "refund": refund, "wallet_balance": balance, "payout": payout}
 
 
 async def t_monthly_summary(month_=None):
@@ -593,6 +653,15 @@ TOOLS = {
     "start_onboarding": (lambda **kw: t_start_onboarding(**kw),  # defined further down, resolved at call time
                           "Prepare onboarding of a new tenant: the voice agent will phone them to confirm name, phone and WhatsApp, then the details form goes on WhatsApp. Needs name, 10 digit phone and a room with a free bed. Nothing happens until the owner says yes, so read the result back and ask the owner to confirm.",
                          P(name="string", phone="string", room="string"), {"owner"}),
+    "start_offboarding": (lambda **kw: t_start_offboarding(**kw),
+                          "Start the move-out of a tenant. move_out_date is YYYY-MM-DD. Nothing is sent to the tenant until the owner sends the settlement from the dashboard.",
+                          P(tenant_name="string", move_out_date="string"), {"owner"}),
+    "add_deduction": (lambda **kw: t_add_deduction(**kw),
+                      "Add a deduction (damage, cleaning, painting) to a tenant's deposit settlement during move-out.",
+                      P(tenant_name="string", reason="string", amount="integer"), {"owner"}),
+    "offboarding_status": (lambda **kw: t_offboarding_status(**kw),
+                           "Show the move-out status and the deposit settlement figures (deposit, deductions, unpaid rent, refund) for a tenant.",
+                           P(tenant_name="string"), {"owner"}),
     "tenant_info": (t_tenant_info, "Full details and month-wise rent history for one tenant (name or room number).",
                     P(tenant_name="string"), {"owner"}),
     "log_promise": (t_log_promise, "Record a tenant's promise to pay amount on date (YYYY-MM-DD).",
@@ -601,12 +670,6 @@ TOOLS = {
     "prepare_payout": (t_prepare_payout, "Prepare a payment to a saved verified payee (vendor). Does NOT send money; the owner must confirm with a PIN in the app.",
                        P(payee_name="string", amount="integer", reason="string"), {"owner"}),
     "settle_deposit": (t_settle_deposit, "Compute deposit refund at move-out. deductions=[{reason,amount}].", P(tenant_id="integer"), {"owner"}),
-    "start_offboarding": (t_start_offboarding, "Start moving out a tenant and ask the owner for deposit deductions.",
-                           P(tenant_name="string"), {"owner"}),
-    "finish_offboarding": (t_finish_offboarding, "Apply move-out deductions and prepare the remaining deposit refund after checking the live Cashfree wallet. Refunds require PIN confirmation.",
-                            {"type": "object", "properties": {"tenant_id": {"type": "integer"}, "deductions": {"type": "array", "items": {
-                                "type": "object", "properties": {"reason": {"type": "string"}, "amount": {"type": "integer"}},
-                                "required": ["reason", "amount"]}}}, "required": ["tenant_id", "deductions"]}, {"owner"}),
     "monthly_summary": (t_monthly_summary, "This month's collected, pending, repairs, vacant beds, deposits held.", P(), {"owner"}),
     "verify_payee": (t_verify_payee, "Verify and save a payee's bank account.", P(name="string", account_no="string", ifsc="string"), {"owner"}),
 }
@@ -635,25 +698,43 @@ async def call_tool(name, args, role="owner", tenant_id=None):
 
 # ---------- agent ----------
 def sys_prompt(role, t):
-    base = (f"You are Kiraya Mitra, a PG rent assistant. Today is {dt.date.today().isoformat()}. The user may write in any Indian language, even in Roman letters. "
-            "ALWAYS reply in plain English only (it is translated afterwards), in 1-2 short sentences, no markdown. Never invent data: call tools. ")
+    base = (f"You are Nele, the assistant of a PG (paying guest hostel) owner. PG always means paying guest accommodation, never postgraduate; you only help with tenants, rent, rooms, tickets and move-outs. Today is {dt.date.today().isoformat()}. The user may write in any Indian language, even in Roman letters. "
+            "ALWAYS reply in plain English only (it is translated afterwards), in one or two short sentences, under 30 words, no markdown. Never invent data: call tools. ")
     if role == "owner":
-        pending = q("select t.id tenant_id, t.name from offboards o join tenants t on t.id=o.tenant_id "
-                    "where o.status='awaiting_deductions' order by o.id desc limit 1")
-        move = (f" {pending[0]['name']} (tenant id {pending[0]['tenant_id']}) is awaiting move-out deductions. "
-                "Ask for reasons and amounts, then call finish_offboarding with a deductions array; use an empty array for no deductions."
-                if pending else " For move-out, call start_offboarding first and ask for deductions before calling finish_offboarding.")
         return base + ("You talk to the PG owner. Never claim money was sent: prepare_payout only prepares; tell the owner to confirm with PIN in the app. "
-                       "For 'who hasn't paid' call get_dues." + move)
+                       "For 'who hasn't paid' call get_dues. Tools that call or message tenants, send settlements, approve or reject people, or end move-outs "
+                       "only STAGE the action: read its readback to the owner and ask them to say yes. Never say it was done. "
+                       "You can do everything the dashboard can: rooms and vacancies, tenant list, tickets, payments, onboarding review, move-out steps. "
+                       "Aadhaar and photo files are dashboard only. Use the conversation so far to understand 'him', 'them', 'that'. "
+                       "If the owner asks to offboard or move someone out and gives no date, use today's date. "
+                       "To pay out or refund a tenant's deposit: call start_offboarding, then add_deduction for each deduction, then move_out_action send_settlement; "
+                       "tell the owner the tenant must accept the settlement and enter bank details on the link, and after that move_out_action prepare_refund is run and the owner confirms with CONFIRM and the PIN. "
+                       "Never call create_rent_link to pay or refund a tenant: it is only for a rent payment link the owner asks for.")
     return base + (f"You talk to tenant {t['name']} (room {t['room']}, id {t['id']}). If they want to pay now, create_rent_link. "
                    "If they say pay half now, create_rent_link with half the pending amount and log_promise for the remainder on the day they name. "
                    "If they promise a later date, log_promise. For problems, create_ticket.")
 
 
-async def llm_agent(text, role, tenant):
+CONV = {}  # who -> [(time, what they said, what we answered)]: the assistant remembers the last few turns
+
+
+def conv_key(role, tenant):
+    return "owner" if role == "owner" else f"t{tenant['id']}"
+
+
+def conv_history(key):
+    now = time.time()
+    CONV[key] = [h for h in CONV.get(key, []) if now - h[0] < 1800][-6:]  # 30 minutes, 6 turns
+    return CONV[key]
+
+
+async def llm_agent(text, role, tenant, history=()):
     schemas = [{"type": "function", "function": {"name": n, "description": d, "parameters": s}}
-               for n, (_, d, s, who) in TOOLS.items() if role in who]
-    msgs = [{"role": "system", "content": sys_prompt(role, tenant)}, {"role": "user", "content": text}]
+               for n, (_, d, s, who) in TOOLS.items() if role in who and n != "send_reminders"]  # the LLM must use the confirmed call_late_tenants
+    msgs = [{"role": "system", "content": sys_prompt(role, tenant)}]
+    for _, said, answered in history:
+        msgs += [{"role": "user", "content": said}, {"role": "assistant", "content": answered}]
+    msgs.append({"role": "user", "content": text})
     calls = []
     for _ in range(5):
         j = await sarvam("/v1/chat/completions", json={"model": LLM, "messages": msgs, "tools": schemas, "temperature": 0.2})
@@ -690,32 +771,22 @@ async def rules(text, role, tenant):  # offline/demo fallback when no Sarvam key
         return r
 
     if role == "owner":
-        pending_move = q("select t.id tenant_id, t.name from offboards o join tenants t on t.id=o.tenant_id "
-                         "where o.status='awaiting_deductions' order by o.id desc limit 1")
-        if pending_move:
-            deductions = []
-            if not re.search(r"\b(no|zero) deductions?\b|\bnothing\b", t):
-                pairs = re.findall(r"([a-z][a-z ]{0,40}?)\s+₹?\s*(\d[\d,]*)", t)
-                if not pairs:
-                    return f"Tell me each deduction and amount for {pending_move[0]['name']}, or say no deductions.", calls
-                deductions = [{"reason": reason.strip(" ,"), "amount": int(amount.replace(",", ""))}
-                              for reason, amount in pairs]
-            r = await use("finish_offboarding", {"tenant_id": pending_move[0]["tenant_id"], "deductions": deductions})
-            if r.get("error"):
-                return r["error"], calls
-            if r.get("payout"):
-                return (f"Deposit ₹{r['deposit']}, deductions ₹{sum(x['amount'] for x in r['deductions'])}, unpaid rent ₹{r['unpaid_dues']}. "
-                        f"Refund ₹{r['refund']} from the owner wallet. Confirm with your PIN."), calls
-            return f"No refund is due. {r['tenant']} has been moved out.", calls
         if re.search(r"remind|kalsi|ellarigu|call (all|them)", t):
-            r = await use("send_reminders", {})
-            s = r.get("calls", [])
-            return (f"Calling {len(s)} tenants now in their own languages: " + ", ".join(x["name"] for x in s) + "." if s
-                    else "Nobody has pending rent."), calls
-        who = next((x for x in q("select name from tenants where status='active'") if x["name"].lower() in t), None)
-        if who and re.search(r"offboard|move.?out|vacat|check.?out", t):
-            r = await use("start_offboarding", {"tenant_name": who["name"]})
-            return r.get("error") or r["question"], calls
+            r = await use("call_late_tenants", {})
+            return (r.get("error") or f"{r['readback']}. Say yes to call."), calls
+        who = next((x for x in q("select name, room from tenants where status='active'") if x["name"].lower() in t or re.search(r"room " + re.escape(x["room"]) + r"\b", t)), None)
+        if who and re.fullmatch(r"\s*call\s+\w+\s*", t):
+            r = await use("call_tenant", {"tenant_name": who["name"]})
+            return (r.get("error") or f"{r['readback']}. Say yes to call."), calls
+        if re.search(r"vacan|empty|free (bed|room)|rooms", t):
+            r = await use("rooms_status", {})
+            return (f"{r['beds_vacant']} of {r['beds_total']} beds vacant. " + "; ".join(f"room {x['room']} {x['free']} free" for x in [y for y in r["rooms"] if y["free"]][:4])), calls
+        if re.search(r"ticket|complaint", t):
+            r = await use("list_tickets", {})
+            return (f"{len(r['tickets'])} open: " + "; ".join(f"#{x['id']} room {x['room']} {x['issue']}" for x in r["tickets"]) if r["tickets"] else "No open tickets."), calls
+        if re.search(r"onboarding", t):
+            r = await use("onboarding_status", {})
+            return ("; ".join(f"{x['name']} room {x['room']} {x['status']}" for x in r["onboarding"]) or "No onboarding in progress."), calls
         if who and re.search(r"cash|received|got|record", t) and re.search(r"\d", t):
             r = await use("record_payment", {"tenant_name": who["name"], "amount": int(re.search(r"(\d[\d,]*)", t).group(1).replace(",", "")),
                                              "method": "cash" if "cash" in t else "upi"})
@@ -734,6 +805,17 @@ async def rules(text, role, tenant):  # offline/demo fallback when no Sarvam key
             wallet = f"₹{s['wallet_balance']:g}" if s["wallet_balance"] is not None else "unavailable"
             return (f"Collected ₹{s['collected']}, pending ₹{s['pending']}, repairs ₹{s['repairs_spent']}, "
                     f"{s['beds_vacant']} beds vacant, deposits held ₹{s['deposits_held']}, Cashfree wallet {wallet}."), calls
+        if who and re.search(r"moving out|move out|vacat|leaving", t):
+            m = re.search(r"(\d{4}-\d{2}-\d{2})|(\d{1,2})(?:st|nd|rd|th)", t)
+            if not m:
+                return "Which date is the move-out?", calls
+            date = m.group(1) or day_of_month(int(m.group(2)))
+            r = await use("start_offboarding", {"tenant_name": who["name"], "move_out_date": date})
+            return (r.get("error") or f"Move-out of {who['name']} noted for {date}. Add deductions, then send the settlement from the dashboard."), calls
+        m = re.search(r"deduct (\d[\d,]*)(?: for)? ([a-z ]+)", t)
+        if who and m:
+            r = await use("add_deduction", {"tenant_name": who["name"], "amount": int(m.group(1).replace(",", "")), "reason": m.group(2).strip()})
+            return (r.get("error") or f"Noted. Refund is now ₹{r['refund']}."), calls
         m = re.search(r"onboard (\w[\w ]*?) (\d{10}) room (\w+)", t)
         if m:
             r = await use("start_onboarding", {"name": m.group(1).title(), "phone": m.group(2), "room": m.group(3)})
@@ -780,10 +862,31 @@ async def rules(text, role, tenant):  # offline/demo fallback when no Sarvam key
     return "You can say: pay now, half now half Friday, salary on the 10th, or report a problem.", calls
 
 
+# plain look-ups need no LLM: the data is fetched and worded directly, which saves several seconds per answer
+FAST_OWNER = re.compile(r"(who|which|yaaru|ellaru).*(not|n't|never|yet|haven|didn|dint|kottilla).*(paid|pay)|unpaid|\bdues\b|pending rent|"
+                        r"vacan|(free|empty|available) (bed|room)|rooms? (status|available)|summary|how much.*collect")
+
+
 async def agent(text, role, tenant=None):
+    key = conv_key(role, tenant)
+    reply, calls = await agent_turn(text, role, tenant, conv_history(key))
+    tools = ", ".join(c["tool"] for c in calls)
+    CONV[key].append((time.time(), text, reply + (f" [tools used: {tools}]" if tools else "")))
+    return reply, calls
+
+
+async def agent_turn(text, role, tenant, history):
+    if role == "owner" and FAST_OWNER.search(text.lower()) and not re.search(r"\d|call|remind|move|onboard", text.lower()):
+        reply, calls = await rules(text, role, tenant)
+        if not reply.startswith("Try:"):
+            if len(calls) == 1 and calls[0]["tool"] == "get_dues" and "dues" in calls[0]["result"]:  # ready-made Kannada: no translation round trip
+                d = calls[0]["result"]["dues"]
+                calls[0]["kn"] = ("ಎಲ್ಲರೂ ಬಾಡಿಗೆ ಪಾವತಿಸಿದ್ದಾರೆ." if not d else f"{len(d)} ಜನರ ಬಾಡಿಗೆ ಬಾಕಿ ಇದೆ. " +
+                                  ". ".join(f"{x['name']}, ಕೊಠಡಿ {x['room']}, {x['pending']} ರೂಪಾಯಿ" for x in d) + ".")
+            return reply, calls
     if SK:
         try:
-            reply, calls = await llm_agent(text, role, tenant)
+            reply, calls = await llm_agent(text, role, tenant, history)
             if reply or calls:
                 return reply or "Done.", calls
         except Exception as e:
@@ -812,17 +915,25 @@ async def voice(role, tenant_id, audio, text):
     return {"transcript": transcript, **await respond(role, tenant, transcript)}
 
 
-async def respond(role, tenant, transcript, codec="wav"):
+NL = chr(10)
+
+
+async def respond(role, tenant, transcript, codec="wav", on_text=None):
     reply_en, calls = await agent(transcript, role, tenant)
     lang = "kn" if role == "owner" else tenant["language"]
-    reply = await tr(reply_en, lang)
+    kn = next((c["kn"] for c in calls if c.get("kn")), None)
+    reply = kn if kn and lang == "kn" else await tr(reply_en, lang)
+    early = asyncio.create_task(on_text(reply + "".join(NL + c["result"]["url"] for c in calls if isinstance(c["result"], dict) and "url" in c["result"]))) if on_text else None
     pending = None
     for c in calls:  # a prepared payout waits for PIN confirmation in the UI
         r = c["result"].get("payout") or c["result"]
         if isinstance(r, dict) and r.get("status") == "pending_confirm" and "payout_id" in r:
             pending = r
+    audio_url = await tts(reply, lang, codec)  # runs while the text is being sent
+    if early:
+        await early
     return {"reply_en": reply_en, "reply_text": reply, "lang": lang,
-            "reply_audio_url": await tts(reply, lang, codec), "tool_calls": calls, "pending_payout": pending,
+            "reply_audio_url": audio_url, "tool_calls": calls, "pending_payout": pending,
             "links": [c["result"]["url"] for c in calls if isinstance(c["result"], dict) and "url" in c["result"]]}
 
 
@@ -886,16 +997,36 @@ async def wa_download(media_id):
         return (await c.get(meta["url"], headers=h)).content
 
 
+YES_WORDS = re.compile(r"\W*(yes|yeah|yep|yup|ok|okay|sure|confirm|confirmed|go ahead|do it|please do|haan|haa|houdu|howdu|sari|correct|right)\b|ಹೌದು|ಸರಿ|हाँ|हां", re.I)
+NO_WORDS = re.compile(r"\W*(no|nope|cancel|stop|nahi|illa|don'?t|do not)\b|ಬೇಡ|ಇಲ್ಲ|नहीं", re.I)
+
+
+def is_yes_no(text):
+    """Speech-to-text gives 'Yes, indeed.' or 'Yes please.', not a bare 'yes': any short answer that opens with yes or no counts."""
+    return len(text.split()) <= 5 and bool(YES_WORDS.match(text) or NO_WORDS.match(text))
+
+
+async def wa_typing(wa_id):
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(f"{GRAPH}/{WA_PHONE_ID}/messages", headers={"Authorization": f"Bearer {WA_TOKEN}"}, json={
+                "messaging_product": "whatsapp", "status": "read", "message_id": wa_id, "typing_indicator": {"type": "text"}})
+    except Exception:
+        pass
+
+
 async def handle_incoming(frm, kind, text=None, media=None, wa_id=None, deliver=True):
     """media = (bytes, filename, mimetype). Owner phone -> owner agent; a tenant's phone -> tenant agent; anyone else ignored."""
     phone = last10(frm)
+    if WA_TOKEN and deliver and wa_id:
+        asyncio.create_task(wa_typing(wa_id))  # blue ticks and "typing..." while the answer is worked out
     tenant = (q("select * from tenants where status='active' and (phone like ? or whatsapp like ?)", ("%" + phone, "%" + phone)) or [None])[0]
     if phone == last10(OWNER_PHONE):
         role = "owner"
     elif tenant:
         role = "tenant"
-    else:
-        return
+    else:  # not the owner, not a tenant: a PG enquiry
+        return await handle_enquiry(phone, kind, text, media, wa_id, deliver)
     try:
         transcript = await transcribe(media[0] if media else None, *(media[1:] if media else (None, None)), text)
     except Exception as e:
@@ -912,10 +1043,20 @@ async def handle_incoming(frm, kind, text=None, media=None, wa_id=None, deliver=
             return await say(phone, f"Done. Payment sent, status {r['status']}.", "kn", role, deliver)
         except ToolError as e:
             return await say(phone, f"Could not confirm: {e}", "kn", role, deliver)
-    if role == "owner" and re.fullmatch(r"\s*(yes|yeah|yep|ok|okay|confirm|go ahead|do it|haan|houdu|sari|no|cancel|stop|nahi|illa)[.!\s]*", transcript, re.I):
-        p = q("select id,name from onboarding where status='pending_confirm' and created > datetime('now','-15 minutes') order by id desc limit 1")
+    if role == "owner" and is_yes_no(transcript):
+        pa = q("select * from pending_actions where status='pending' and created > datetime('now','-15 minutes') order by id desc limit 1")
+        ob = q("select id,name from onboarding where status='pending_confirm' and created > datetime('now','-15 minutes') order by id desc limit 1")
+        p = ob if ob and (not pa or ob[0]["id"] and q("select created > ? n from onboarding where id=?", (pa[0]["created"], ob[0]["id"]))[0]["n"]) else []
+        if pa and not p:
+            no = NO_WORDS.match(transcript)
+            q("update pending_actions set status=? where id=?", ("cancelled" if no else "done", pa[0]["id"]))
+            try:
+                msg = "Cancelled. Nothing was done." if no else await run_pending(pa[0])
+            except (ToolError, HTTPException) as e:
+                msg = f"Could not do it: {getattr(e, 'detail', e)}"
+            return await say(phone, msg, "kn", role, deliver)
         if p:
-            if re.match(r"\s*(no|cancel|stop|nahi|illa)", transcript, re.I):
+            if NO_WORDS.match(transcript):
                 q("update onboarding set status='cancelled' where id=?", (p[0]["id"],))
                 return await say(phone, f"Cancelled. {p[0]['name']} will not be contacted.", "kn", role, deliver)
             try:
@@ -924,11 +1065,22 @@ async def handle_incoming(frm, kind, text=None, media=None, wa_id=None, deliver=
                                  else f"The form was sent to {r['name']} on WhatsApp.", "kn", role, deliver)
             except ToolError as e:
                 return await say(phone, str(e), "kn", role, deliver)
-    r = await respond(role, tenant, transcript, WA_CODEC if (WA_TOKEN and deliver) else "wav")
-    reply = r["reply_text"] + ("\n" + "\n".join(r["links"]) if r["links"] else "")
+    live = bool(WA_TOKEN and deliver)
+    sent = []
+
+    async def early(txt):
+        sent.append(txt)
+        await wa_send(phone, txt)
+
+    r = await respond(role, tenant, transcript, WA_CODEC if live else "wav", early if live else None)
+    reply = r["reply_text"] + (NL + NL.join(r["links"]) if r["links"] else "")
     log_msg(phone, role, "out", "audio" if r["reply_audio_url"] else "text", reply, r["reply_audio_url"])
     if deliver:
-        await wa_send(phone, reply, r["reply_audio_url"])
+        if sent:
+            if r["reply_audio_url"]:
+                await wa_send(phone, None, r["reply_audio_url"])
+        else:
+            await wa_send(phone, reply, r["reply_audio_url"])
     if r["pending_payout"]:
         await say(phone, f"{r['pending_payout']['readback']}. To send, type: CONFIRM and your PIN.", "kn" if role == "owner" else "en", role, deliver)
 
@@ -1014,7 +1166,7 @@ async def place_call_samvaad(t, pending):
 
 
 async def place_call_twilio(t, pending):
-    msg = (f"Hello {t['name']}. This is Kiraya Mitra from {PROPERTY['name']}. Your rent of {pending} rupees for room {t['room']} "
+    msg = (f"Hello {t['name']}. This is Nele from {PROPERTY['name']}. Your rent of {pending} rupees for room {t['room']} "
            "is pending. When will you be able to pay?")
     text = await tr(msg, t["language"])
     url = await tts(text, t["language"])
@@ -1333,7 +1485,7 @@ async def apply_payment(link_id, total_paid, txn=None, background_tasks=None):
         if c.execute("select 1 from payments where txn_id=?", (txn,)).fetchone():
             c.commit()
             return {"ok": True, "duplicate": True}
-        total_paid = min(int(total_paid), p["amount"])
+        total_paid = min(round(float(total_paid)), p["amount"])  # Cashfree sends "5000.00"
         delta = total_paid - p["paid"]
         if delta <= 0:
             c.commit()
@@ -1371,7 +1523,7 @@ async def send_receipts(p, delta, left, txn, receipt_no):
     t = tenant_row(p["tenant_id"])
     lines = (f"Receipt: {receipt_no}\nTenant: {t['name']} (Room {t['room']})\nFor: {p['month']}\nPaid: ₹{delta}\nBalance: ₹{left}\n"
              f"Method: {p['method'].upper()}\nTransaction ID: {txn}\nDate: {dt.datetime.now().strftime('%d %b %Y %H:%M')}\n"
-             f"{PUBLIC_URL}/receipt/{receipt_no}")
+             f"{PUBLIC_URL}/receipt/{receipt_no}?k={receipt_key(receipt_no)}")
     await say(OWNER_PHONE, f"{t['name']}, room {t['room']}, paid {delta} rupees. Receipt and transaction details are below.", "kn", extra=lines)
     thanks = await tr(f"Thank you {t['name']}. We have received your rent payment of Rs {delta}.", t["language"])
     await send_to_tenant(t, f"{thanks}\n{lines}", WA_RECEIPT_TEMPLATE, [t["name"], delta, receipt_no, txn])
@@ -1382,9 +1534,10 @@ async def send_receipts(p, delta, left, txn, receipt_no):
 async def lifespan(_):
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
-    for migration in ("alter table tenants add column whatsapp text", "alter table payouts add column offboard_id int"):
+    for alter in ("alter table tenants add column whatsapp text", "alter table tickets add column caller text",
+                  "alter table tickets add column ref text"):  # databases created before these columns existed
         try:
-            c.execute(migration)
+            c.execute(alter)
             c.commit()
         except sqlite3.OperationalError:
             pass
@@ -1394,8 +1547,30 @@ async def lifespan(_):
     yield
 
 
-app = FastAPI(title="Kiraya Mitra", lifespan=lifespan)
+app = FastAPI(title="Nele", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+
+# Only these paths may be reached through the public tunnel. Everything else (dashboard data, /tools, /voice, file downloads)
+# is for the local dashboard only: it has no login, so it must never be reachable from the internet.
+PUBLIC_PREFIXES = ("/webhooks/", "/onboard/", "/onboard-api/", "/receipt/", "/pay/", "/static/", "/calls/", "/dev/simulate-payment/", "/settle/", "/settle-api/", "/autopay/", "/voice-tools/")
+
+
+def is_public(request) -> bool:
+    """True when the request came in through ngrok (https, or a host that is not this computer)."""
+    h = request.headers
+    return h.get("x-forwarded-proto") == "https" or h.get("host", "").split(":")[0] not in ("localhost", "127.0.0.1", "testserver")
+
+
+@app.middleware("http")
+async def public_guard(request: Request, call_next):
+    if is_public(request) and not request.url.path.startswith(PUBLIC_PREFIXES):
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    return await call_next(request)
+
+
+def receipt_key(no):  # receipt numbers run in sequence, so the public link carries a secret too
+    secret = WA_APP_SECRET or SV_KEY or TW_TOKEN or WA_TOKEN or "kiraya"
+    return hmac.new(secret.encode(), f"receipt{no}".encode(), hashlib.sha256).hexdigest()[:16]
 
 
 @app.get("/")
@@ -1526,7 +1701,7 @@ async def webhook_payment(request: Request, background_tasks: BackgroundTasks):
         d = json.loads(raw).get("data", {})
     except json.JSONDecodeError:
         raise HTTPException(400, "invalid JSON")
-    link_id = d.get("link_id")
+    link_id = d.get("link_id") or ((d.get("order") or {}).get("order_tags") or {}).get("link_id")  # order-style events carry it in the tags
     if not link_id:
         return {"ok": True, "ignored": True}
     payment = d.get("payment") or {}
@@ -1539,7 +1714,16 @@ async def webhook_payment(request: Request, background_tasks: BackgroundTasks):
     if float(paid or 0) <= 0:
         raise HTTPException(400, "invalid paid amount")
     txn = d.get("cf_payment_id") or payment.get("cf_payment_id") or (d.get("order") or {}).get("transaction_id")
+    txn = str(txn) if txn else None
     return await apply_payment(link_id, paid, txn, background_tasks)
+
+
+@app.post("/payouts/{payout_id}/check")
+async def payout_check(payout_id: int):
+    try:
+        return {"status": await check_payout(payout_id)}
+    except ToolError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/webhooks/cashfree/payout")
@@ -1555,27 +1739,13 @@ async def webhook_payout(request: Request):
     transfer_id = transfer.get("transfer_id")
     if not transfer_id:
         return {"ok": True, "ignored": True}
-    rows = q("select o.*, p.name from payouts o join payees p on p.id=o.payee_id where o.cf_transfer_id=?", (transfer_id,))
-    if not rows:
-        raise HTTPException(404, "unknown transfer")
-    old = rows[0]
     event = str(body.get("type") or body.get("event_type") or "").upper()
     status = str(transfer.get("status") or "").upper()
     code = str(transfer.get("status_code") or "").upper()
-    if status == "SUCCESS" and code == "COMPLETED":
-        new = "success"
-    elif "REVERSE" in event or status == "REVERSED":
-        new = "reversed"
-    elif "FAIL" in event or status == "FAILED":
-        new = "failed"
-    else:
-        new = "processing"
-    q("update payouts set status=? where id=?", (new, old["id"]))
-    refresh_wallet()
-    audit("cashfree", "payout_status", {"payout_id": old["id"], "transfer_id": transfer_id, "status": new})
-    if new == "success" and old["status"] != "success":
-        await publish("payout_done", f"Paid {old['name']} {old['amount']} rupees",
-                      payee=old["name"], amount=old["amount"], reason=old["reason"])
+    try:
+        new = await apply_payout_status(transfer_id, status, code, event)
+    except LookupError:
+        raise HTTPException(404, "unknown transfer")
     return {"ok": True, "status": new}
 
 
@@ -1605,7 +1775,9 @@ m.textContent=r.ok?'Paid. You can close this tab.':'Failed';}}</script>"""
 
 
 @app.get("/receipt/{rno}", response_class=HTMLResponse)
-def receipt_page(rno: str):
+def receipt_page(rno: str, request: Request, k: str = ""):
+    if is_public(request) and not hmac.compare_digest(k, receipt_key(rno)):
+        raise HTTPException(404, "unknown receipt")
     r = q("select p.*, t.name, t.room from payments p join tenants t on t.id=p.tenant_id where receipt_no=?", (rno,))
     if not r:
         raise HTTPException(404, "unknown receipt")
@@ -1662,6 +1834,11 @@ async def wa_hook(request: Request, bg: BackgroundTasks):
             for m in ch.get("value", {}).get("messages", []):
                 if not q("select 1 from messages where wa_id=?", (m["id"],)):  # Meta retries; process each message once
                     bg.add_task(process_wa, m)
+            for st in ch.get("value", {}).get("statuses", []):
+                if st.get("status") == "failed":  # e.g. 131047: the person has not messaged the bot in the last 24 hours
+                    err = (st.get("errors") or [{}])[0]
+                    print("whatsapp delivery failed:", st.get("recipient_id"), err.get("code"), err.get("title"))
+                    audit("whatsapp", "delivery_failed", {"to": st.get("recipient_id"), "code": err.get("code"), "title": err.get("title")})
     return {"ok": True}
 
 
@@ -1760,7 +1937,7 @@ async def call_incoming(request: Request):
     t = t[0]
     q("insert into calls(tenant_id,month,status,text,turn) values(?,?,'inbound','',1)", (t["id"], month()))
     cid = q.last
-    greet = await speak_xml(f"Hello {t['name']}. This is Kiraya Mitra. Please tell me your problem after the pause, and I will inform the owner.", t["language"])
+    greet = await speak_xml(f"Hello {t['name']}. This is Nele. Please tell me your problem after the pause, and I will inform the owner.", t["language"])
     return twiml(greet + (f'<Record action="{PUBLIC_URL}/calls/grievance/{cid}?k={call_key(cid)}" method="POST" maxLength="40" timeout="4" '
                           'playBeep="true" trim="trim-silence"/>'))
 
@@ -1824,11 +2001,11 @@ async def sarvam_inbound_hook(request: Request):
     if not hmac.compare_digest(request.query_params.get("k", ""), voice_key()):
         raise HTTPException(403, "bad key")
     d = await request.json()
-    t = q("select * from tenants where status='active' and phone like ?", ("%" + last10(d.get("user_phone_number")),))
+    caller = last10(d.get("user_phone_number"))
+    t = q("select * from tenants where status='active' and (phone like ? or whatsapp like ?)", ("%" + caller, "%" + caller))
     iid = d.get("interaction_id")
-    if not t or (iid and q("select 1 from calls where call_sid=?", (iid,))):
-        return {"ok": True, "ignored": True}
-    t = t[0]
+    if iid and (q("select 1 from calls where call_sid=?", (iid,)) or q("select 1 from tickets where ref=?", (iid,))):
+        return {"ok": True, "ignored": True}  # the same call delivered twice
     dialogue, said = dialogue_of(d)
     v = d.get("final_agent_variables") or d.get("output_agent_variables") or {}
     issue = str(v.get("issue") or said).strip()
@@ -1836,8 +2013,15 @@ async def sarvam_inbound_hook(request: Request):
         return {"ok": True, "ignored": True}
     if str(v.get("urgency", "")).lower() == "high":
         issue = "[URGENT] " + issue
-    q("insert into calls(tenant_id,month,status,text,turn,call_sid) values(?,?,'inbound','',1,?)", (t["id"], month(), iid))
-    await file_grievance(t, issue, q.last, dialogue)
+    if t:
+        q("insert into calls(tenant_id,month,status,text,turn,call_sid) values(?,?,'inbound','',1,?)", (t[0]["id"], month(), iid))
+        await file_grievance(t[0], issue, q.last, dialogue)
+    else:  # complaints come from registered numbers only; an unknown caller is a PG enquiry and the owner gets their number
+        audit("caller", "complaint_rejected_unregistered", {"caller_ending": caller[-4:], "interaction": iid})
+        if len(caller) == 10:
+            e, _ = enquiry_upsert(caller, said or issue, name=str(v.get("name") or "").strip()[:60] or None, note=str(v.get("interest") or issue)[:300], source="call")
+            await notify_owner_enquiry(e, "Someone phoned asking about the PG.")
+        return {"ok": True, "ignored": True}
     return {"ok": True}
 
 
@@ -1917,7 +2101,8 @@ def activity():
     return {"payments": q("select p.id,t.name,t.room,p.month,p.amount,p.paid,p.method,p.status,p.paid_ts,p.ts,p.txn_id,p.receipt_no from payments p "
                           "join tenants t on t.id=p.tenant_id order by coalesce(p.paid_ts,p.ts) desc, p.id desc limit 150"),
             "payouts": q("select o.id,p.name payee,o.amount,o.reason,o.kind,o.status,o.day from payouts o join payees p on p.id=o.payee_id order by o.id desc limit 100"),
-            "tickets": q("select k.id,t.name,t.room,k.issue,k.status,k.ts from tickets k join tenants t on t.id=k.tenant_id order by k.id desc limit 100"),
+            "tickets": q("select k.id,coalesce(t.name,'Unknown caller '||k.caller) name,coalesce(t.room,'-') room,k.issue,k.status,k.ts from tickets k "
+                         "left join tenants t on t.id=k.tenant_id order by k.id desc limit 100"),
             "calls": q("select c.id,t.name,t.room,t.language,c.status,c.outcome,c.ts,c.transcript,c.reason,c.promise_date from calls c join tenants t on t.id=c.tenant_id order by c.id desc limit 100"),
             "audit": q("select ts,actor,action,payload from audit_log order by id desc limit 100")}
 
@@ -2064,6 +2249,7 @@ async def onboard_submit(token: str, request: Request, bg: BackgroundTasks):
         raise HTTPException(409, "This form has already been submitted.")
     form = await request.form()
     f = {k: str(v).strip() for k, v in form.items() if not hasattr(v, "filename")}
+    f["name"] = await english_name(f.get("name", ""))
     missing = [k for k in REQUIRED if not f.get(k)]
     if missing:
         raise HTTPException(400, "Please fill: " + ", ".join(m.replace("_", " ") for m in missing))
@@ -2191,7 +2377,7 @@ async def sarvam_onboarding_hook(request: Request):
     v = d.get("final_agent_variables") or {}
     name = ob["name"]
     if str(v.get("name_confirmed", "")).lower() == "no" and str(v.get("corrected_name", "")).strip():
-        name = str(v["corrected_name"]).strip()
+        name = await english_name(str(v["corrected_name"]).strip())
     wa = last10(v.get("whatsapp_number")) if str(v.get("whatsapp_same", "")).lower() == "no" else ""
     interest = str(v.get("form_ok", "")).lower()
     q("update onboarding set name=?, whatsapp=?, call_outcome=? where id=?", (name, wa if len(wa) == 10 else None, interest or "connected", oid))
@@ -2203,3 +2389,651 @@ async def sarvam_onboarding_hook(request: Request):
     await say(OWNER_PHONE, f"{name} confirmed the details on the call. The onboarding form was sent on WhatsApp.", "kn",
               extra=f"Phone: {ob['phone']}\nWhatsApp: {wa if len(wa) == 10 else 'same as phone'}")
     return {"ok": True}
+
+
+# ---------- offboarding: move-out and deposit refund ----------
+OPEN_OFFBOARDING = ("notice", "proposed", "disputed", "accepted")
+
+
+def inr(n):
+    return f"₹{int(n):,}"
+
+
+def ob_figures(of):
+    """Deposit - deductions - unpaid rent. A positive result is refunded; a negative one is still owed by the tenant."""
+    ded = json.loads(of["deductions_json"] or "[]")
+    dtotal = sum(int(d["amount"]) for d in ded)
+    dues = q("select coalesce(sum(due-paid),0) s from ledger where tenant_id=?", (of["tenant_id"],))[0]["s"]
+    net = of["deposit"] - dtotal - dues
+    return {"deposit": of["deposit"], "deductions": ded, "deductions_total": dtotal, "unpaid_dues": dues,
+            "refund": max(net, 0), "shortfall": max(-net, 0)}
+
+
+def ob_lines(f):
+    lines = [f"Deposit: {inr(f['deposit'])}"]
+    if f["deductions"]:
+        lines.append("Deductions: " + "; ".join(f"{d['reason']} {inr(d['amount'])}" for d in f["deductions"]) + f" (total {inr(f['deductions_total'])})")
+    lines.append(f"Unpaid rent: {inr(f['unpaid_dues'])}")
+    lines.append(f"Refund to you: {inr(f['refund'])}" if f["refund"] or not f["shortfall"] else f"Balance you still owe: {inr(f['shortfall'])}")
+    return "\n".join(lines)
+
+
+def ob_row(oid):
+    r = q("select * from offboarding where id=?", (oid,))
+    if not r:
+        raise HTTPException(404, "unknown move-out")
+    return r[0]
+
+
+def open_offboarding(tid):
+    r = q(f"select * from offboarding where tenant_id=? and status in ({','.join('?' * len(OPEN_OFFBOARDING))}) order by id desc limit 1",
+          (tid, *OPEN_OFFBOARDING))
+    return r[0] if r else None
+
+
+def clean_deductions(items):
+    out = []
+    for d in items or []:
+        reason = str(d.get("reason", "")).strip()
+        try:
+            amount = int(d.get("amount"))
+        except (TypeError, ValueError):
+            raise ToolError("each deduction needs an amount in whole rupees")
+        if not reason or amount <= 0:
+            raise ToolError("each deduction needs a reason and a positive amount")
+        out.append({"reason": reason[:80], "amount": amount})
+    return out
+
+
+def save_deductions(of, items):
+    if of["status"] not in ("notice", "proposed", "disputed"):
+        raise ToolError("the tenant already accepted this settlement; cancel the move-out to change it")
+    items = clean_deductions(items)
+    # the figures changed, so whatever the tenant was shown is out of date and must be sent again
+    q("update offboarding set deductions_json=?, status='notice' where id=?", (json.dumps(items, ensure_ascii=False), of["id"]))
+    return ob_figures(ob_row(of["id"]))
+
+
+async def t_start_offboarding(tenant_id, move_out_date, reason=""):
+    t = tenant_row(int(tenant_id))
+    try:
+        d = dt.date.fromisoformat(str(move_out_date)[:10])
+    except ValueError:
+        raise ToolError("move_out_date must be a date like 2026-12-30")
+    if not dt.date.today() - dt.timedelta(days=7) <= d <= dt.date.today() + dt.timedelta(days=120):
+        raise ToolError("the move-out date must be within the next four months")
+    if open_offboarding(t["id"]):
+        raise ToolError(f"{t['name']} already has a move-out in progress")
+    q("insert into offboarding(tenant_id,move_out_date,reason,deposit) values(?,?,?,?)", (t["id"], d.isoformat(), reason, t["deposit"]))
+    oid = q.last
+    audit("owner", "offboarding_started", {"id": oid, "tenant": t["name"], "date": d.isoformat()})
+    return {"offboarding_id": oid, "status": "notice", "move_out_date": d.isoformat(), **ob_figures(ob_row(oid))}
+
+
+async def t_add_deduction(tenant_id, reason, amount):
+    t = tenant_row(int(tenant_id))
+    of = open_offboarding(t["id"])
+    if not of:
+        raise ToolError(f"{t['name']} has no move-out in progress; start one first")
+    f = save_deductions(of, json.loads(of["deductions_json"] or "[]") + [{"reason": reason, "amount": amount}])
+    audit("owner", "deduction_added", {"offboarding": of["id"], "reason": reason, "amount": amount})
+    return {"status": "notice", **f}
+
+
+async def t_offboarding_status(tenant_id):
+    r = q("select * from offboarding where tenant_id=? order by id desc limit 1", (int(tenant_id),))
+    if not r:
+        raise ToolError("no move-out for this tenant")
+    return {"status": r[0]["status"], "move_out_date": r[0]["move_out_date"], **ob_figures(r[0])}
+
+
+async def propose_settlement(oid):
+    of = ob_row(oid)
+    if of["status"] not in ("notice", "proposed", "disputed"):
+        raise ToolError(f"cannot send a settlement while the move-out is {of['status']}")
+    t = q("select * from tenants where id=?", (of["tenant_id"],))[0]
+    f = ob_figures(of)
+    token = of["token"] or secrets.token_urlsafe(24)
+    expires = (dt.datetime.now() + dt.timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
+    q("update offboarding set status='proposed', token=?, expires=?, proposed_at=datetime('now','localtime'), dispute_note=null where id=?", (token, expires, oid))
+    url = f"{PUBLIC_URL}/settle/{token}"
+    head = await tr(f"Hello {t['name']}. Your move-out from room {t['room']} is on {of['move_out_date']}. "
+                    "Here is your deposit settlement. Please review it and confirm:", t["language"])
+    ok = await send_to_tenant(t, f"{head}\n{ob_lines(f)}\n{url}", WA_SETTLE_TEMPLATE, [t["name"], url])
+    audit("owner", "settlement_sent", {"offboarding": oid, "delivered": ok})
+    return {"delivered": ok, "link": url, **f}
+
+
+async def finalize_offboarding(of, txn=None, paid_out=0):
+    """The tenant leaves: dues are settled from the deposit, the bed is freed, both sides get a message."""
+    t = q("select * from tenants where id=?", (of["tenant_id"],))[0]
+    f = ob_figures(of)
+    budget = max(of["deposit"] - f["deductions_total"], 0)  # deductions come off the deposit first, then unpaid rent
+    for r in q("select * from ledger where tenant_id=? and due>paid order by month", (t["id"],)):
+        adj = min(r["due"] - r["paid"], budget)
+        if adj <= 0:
+            break
+        q("insert into payments(tenant_id,link_id,amount,paid,month,url,status,method,paid_ts,txn_id,receipt_no) "
+          "values(?,?,?,?,?,'','paid','deposit',datetime('now','localtime'),?,?)",
+          (t["id"], f"deposit_{of['id']}_{r['month']}", adj, adj, r["month"], f"DEPOSIT-ADJ-{of['id']}", f"KM-{r['month'].replace('-', '')}-ADJ{of['id']}"))
+        q("update ledger set paid=paid+?, status=case when paid+?>=due then 'paid' else 'partial' end, promise_date=null where id=?", (adj, adj, r["id"]))
+        budget -= adj
+    q("update tenants set status='moved_out' where id=?", (t["id"],))
+    q("update offboarding set status=?, completed_at=datetime('now','localtime') where id=?", ("refunded" if paid_out else "closed", of["id"]))
+    audit("owner", "offboarding_completed", {"offboarding": of["id"], "tenant": t["name"], "refund": paid_out, "txn": txn})
+    last4 = (of["bank_account"] or "")[-4:]
+    raw = ob_lines(f) + (f"\nSent to: account ending {last4}\nTransaction ID: {txn}" if paid_out else "")
+    done = await tr(f"Thank you {t['name']}. Your move-out is complete." + (" Your deposit refund has been sent." if paid_out else ""), t["language"])
+    await send_to_tenant(t, f"{done}\n{raw}", "", [])
+    await say(OWNER_PHONE, f"{t['name']} has moved out of room {t['room']}." + (f" Deposit refund of {paid_out} rupees sent." if paid_out else ""), "kn", extra=raw)
+    return {"status": "refunded" if paid_out else "closed"}
+
+
+async def finish_offboarding_after_refund(payout, txn):
+    r = q("select * from offboarding where payout_id=? and status='accepted'", (payout["id"],))
+    if r:
+        await finalize_offboarding(r[0], txn, payout["amount"])
+
+
+# ----- tenant-facing settlement page -----
+def settle_live(token):
+    r = q("select * from offboarding where token=?", (token,))
+    if not r:
+        raise HTTPException(404, "This link is not valid.")
+    if r[0]["status"] == "proposed" and r[0]["expires"] < dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
+        raise HTTPException(410, "This link has expired. Please ask the owner for a new one.")
+    return r[0]
+
+
+@app.get("/settle/{token}")
+def settle_page(token: str):
+    return FileResponse(ROOT / "static" / "settle.html")
+
+
+@app.get("/settle-api/{token}")
+def settle_prefill(token: str):
+    of = settle_live(token)
+    t = q("select name,room from tenants where id=?", (of["tenant_id"],))[0]
+    f = ob_figures(of)
+    return {"property": PROPERTY["name"], "name": t["name"], "room": t["room"], "move_out_date": of["move_out_date"],
+            "status": of["status"], "requires_bank": f["refund"] > 0, **f}
+
+
+@app.post("/settle-api/{token}")
+async def settle_answer(token: str, request: Request, bg: BackgroundTasks):
+    of = settle_live(token)
+    if of["status"] != "proposed":
+        raise HTTPException(409, "This settlement was already answered or has been changed. Please ask the owner for a new link.")
+    b = await request.json()
+    t = q("select * from tenants where id=?", (of["tenant_id"],))[0]
+    f = ob_figures(of)
+    if b.get("action") == "dispute":
+        note = str(b.get("note", "")).strip()
+        if not note:
+            raise HTTPException(400, "Please tell us what you disagree with.")
+        q("update offboarding set status='disputed', dispute_note=?, responded_at=datetime('now','localtime') where id=?", (note[:500], of["id"]))
+        bg.add_task(say, OWNER_PHONE, f"{t['name']} does not agree with the deposit settlement. Please review it in the dashboard.", "kn", "owner", True, f"Reason: {note[:300]}")
+        return {"ok": True, "status": "disputed"}
+    if b.get("action") != "accept":
+        raise HTTPException(400, "Choose accept or dispute.")
+    if f["refund"] > 0:
+        holder, acc, ifsc = str(b.get("account_holder", "")).strip(), re.sub(r"\D", "", str(b.get("account_number", ""))), str(b.get("ifsc", "")).strip().upper()
+        if len(holder) < 3 or not 9 <= len(acc) <= 18 or not re.fullmatch(r"[A-Z]{4}0[A-Z0-9]{6}", ifsc):
+            raise HTTPException(400, "Please give the account holder's name, the account number and a valid IFSC code.")
+        try:
+            v = await t_verify_payee(holder, acc, ifsc)
+        except ToolError as e:
+            raise HTTPException(400, str(e))
+        if not v["verified"]:
+            raise HTTPException(400, "We could not verify these bank details. Please check them and try again.")
+        q("update offboarding set bank_name=?, bank_account=?, bank_ifsc=?, payee_id=? where id=?", (v.get("bank_name_match") or holder, acc, ifsc, v["payee_id"], of["id"]))
+    q("update offboarding set status='accepted', responded_at=datetime('now','localtime') where id=?", (of["id"],))
+    msg = (f"{t['name']} accepted the deposit settlement. Refund {f['refund']} rupees to the account ending {acc[-4:]}. Please approve the payout in the dashboard."
+           if f["refund"] > 0 else f"{t['name']} accepted the deposit settlement. Nothing is to be refunded. Please complete the move-out in the dashboard.")
+    bg.add_task(say, OWNER_PHONE, msg, "kn", "owner", True, ob_lines(f))
+    return {"ok": True, "status": "accepted"}
+
+
+# ----- owner dashboard -----
+@app.get("/offboarding")
+def offboarding_list():
+    rows = q("select o.id,o.tenant_id,t.name,t.room,o.move_out_date,o.status,o.created from offboarding o join tenants t on t.id=o.tenant_id order by o.id desc")
+    return [{**r, **{k: v for k, v in ob_figures(ob_row(r["id"])).items() if k in ("refund", "shortfall")}} for r in rows]
+
+
+@app.get("/offboarding/{oid}")
+def offboarding_get(oid: int):
+    of = ob_row(oid)
+    t = q("select name,room,phone,language from tenants where id=?", (of["tenant_id"],))[0]
+    pay = q("select id,amount,status from payouts where id=?", (of["payout_id"],)) if of["payout_id"] else []
+    return {"id": oid, "tenant_id": of["tenant_id"], "tenant": t, "status": of["status"], "move_out_date": of["move_out_date"], "reason": of["reason"],
+            "figures": ob_figures(of), "dispute_note": of["dispute_note"], "link": f"{PUBLIC_URL}/settle/{of['token']}" if of["token"] else None,
+            "bank": {"holder": of["bank_name"], "last4": (of["bank_account"] or "")[-4:], "ifsc": of["bank_ifsc"]} if of["bank_account"] else None,
+            "payout": pay[0] if pay else None, "proposed_at": of["proposed_at"], "responded_at": of["responded_at"], "completed_at": of["completed_at"]}
+
+
+@app.post("/offboarding/start")
+async def offboarding_start(request: Request):
+    b = await request.json()
+    try:
+        return await t_start_offboarding(b["tenant_id"], b["move_out_date"], b.get("reason", ""))
+    except ToolError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/offboarding/{oid}/deductions")
+async def offboarding_deductions(oid: int, request: Request):
+    try:
+        return save_deductions(ob_row(oid), (await request.json()).get("deductions", []))
+    except ToolError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/offboarding/{oid}/propose")
+async def offboarding_propose(oid: int):
+    try:
+        return await propose_settlement(oid)
+    except ToolError as e:
+        raise HTTPException(400, str(e))
+
+
+async def prepare_refund(oid):
+    """Prepare the refund. Money moves only after the owner confirms with the PIN."""
+    of = ob_row(oid)
+    f = ob_figures(of)
+    if of["status"] != "accepted" or f["refund"] <= 0 or not of["payee_id"]:
+        raise ToolError("A refund can be prepared only after the tenant accepted a settlement with a refund due.")
+    if of["payout_id"]:
+        prev = q("select status from payouts where id=?", (of["payout_id"],))
+        if prev and prev[0]["status"] in ("processing", "success"):  # never pay a deposit twice
+            raise ToolError(f"The refund is already {prev[0]['status']}. Wait for Cashfree to confirm it.")
+        q("update payouts set status='cancelled' where id=? and status='pending_confirm'", (of["payout_id"],))
+    if not MOCK_PAYOUT:  # fail now, not after the owner has typed the PIN
+        bal = (await cashfree_wallet())["available_balance"]
+        if f["refund"] > bal:
+            raise ToolError(f"The Cashfree payout wallet has {inr(bal)} but the refund is {inr(f['refund'])}. Add funds first.")
+    t = q("select room from tenants where id=?", (of["tenant_id"],))[0]
+    r = await t_prepare_payout(f["refund"], f"Deposit refund room {t['room']}", payee_id=of["payee_id"], kind="deposit")
+    q("update offboarding set payout_id=? where id=?", (r["payout_id"], oid))
+    return r
+
+
+@app.post("/offboarding/{oid}/payout")
+async def offboarding_payout(oid: int):
+    try:
+        return await prepare_refund(oid)
+    except ToolError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/offboarding/{oid}/payout/confirm")
+async def offboarding_payout_confirm(oid: int, request: Request):
+    of = ob_row(oid)
+    if not of["payout_id"] or of["status"] != "accepted":
+        raise HTTPException(400, "No refund is waiting for confirmation.")
+    try:
+        return await confirm_payout(of["payout_id"], (await request.json()).get("pin", ""))
+    except ToolError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/offboarding/{oid}/complete")
+async def offboarding_complete(oid: int):
+    of = ob_row(oid)
+    if of["status"] != "accepted" or ob_figures(of)["refund"] > 0:
+        raise HTTPException(400, "Only an accepted settlement with no refund due can be completed without a payout.")
+    return await finalize_offboarding(of)
+
+
+@app.post("/offboarding/{oid}/cancel")
+async def offboarding_cancel(oid: int):
+    of = ob_row(oid)
+    if of["status"] not in OPEN_OFFBOARDING:
+        raise HTTPException(400, "This move-out is already finished.")
+    if of["payout_id"]:
+        q("update payouts set status='cancelled' where id=? and status='pending_confirm'", (of["payout_id"],))
+    q("update offboarding set status='cancelled' where id=?", (oid,))
+    return {"status": "cancelled"}
+
+
+# ---------- owner on WhatsApp can do everything the dashboard does ----------
+CALL_KINDS = ("call_tenant", "call_late")
+
+
+def stage(kind, arg, summary):
+    """Anything that messages, calls or moves a tenant waits for the owner's 'yes' (15 minutes)."""
+    old = q("select * from pending_actions where status='pending' and created > datetime('now','-15 minutes') order by id desc limit 1")
+    if old and kind in CALL_KINDS and old[0]["kind"] in CALL_KINDS:  # "call everyone" arrives as several calls: add them up, never replace
+        oa = json.loads(old[0]["arg"])
+        if "call_late" in (kind, old[0]["kind"]):
+            kind, arg, summary = "call_late", {}, summary if kind == "call_late" else old[0]["summary"]
+        else:
+            arg = {"tenant_ids": sorted(set(oa["tenant_ids"]) | set(arg["tenant_ids"]))}
+            summary = old[0]["summary"] + "; " + summary
+    q("update pending_actions set status='cancelled' where status='pending'")
+    q("insert into pending_actions(kind,arg,summary) values(?,?,?)", (kind, json.dumps(arg), summary))
+    return {"status": "needs_confirm", "readback": summary}
+
+
+async def run_pending(pa):
+    a = json.loads(pa["arg"])
+    k = pa["kind"]
+    if k in ("call_tenant", "call_late"):
+        r = await t_send_reminders(a.get("tenant_ids"))
+        names = ", ".join(x["name"] for x in r["calls"])
+        return f"Calling {names} now." if names else "Nobody has pending rent."
+    if k == "send_settlement":
+        r = await propose_settlement(a["oid"])
+        return f"Settlement sent to the tenant on WhatsApp. Refund {inr(r['refund'])}." if r["delivered"] else "WhatsApp could not deliver it. Share the link from the dashboard."
+    if k == "complete_move_out":
+        await offboarding_complete(a["oid"])
+        return "Move-out completed. The bed is free."
+    if k == "cancel_move_out":
+        await offboarding_cancel(a["oid"])
+        return "Move-out cancelled. The tenant stays."
+    if k == "approve_onboarding":
+        await onboarding_approve(a["oid"])
+        return "Approved. The tenant was added and got the welcome message."
+    if k == "reject_onboarding":
+        await onboarding_reject(a["oid"])
+        return "Rejected."
+    if k == "resend_form":
+        await onboarding_resend(a["oid"])
+        return "The form link was sent again."
+    raise ToolError("unknown action")
+
+
+async def t_rooms_status():
+    occ = q("select name,room from tenants where status='active' order by id")
+    rooms_ = [{"room": r, "sharing": v["sharing"], "rent": v["rent"], "occupants": [o["name"] for o in occ if o["room"] == r],
+               "held": ob_reserved(r)} for r, v in ROOMS.items()]
+    for x in rooms_:
+        x["free"] = max(x["sharing"] - len(x["occupants"]) - x["held"], 0)
+    return {"beds_total": sum(x["sharing"] for x in rooms_), "beds_vacant": sum(x["free"] for x in rooms_), "rooms": rooms_}
+
+
+async def t_list_tenants():
+    return {"tenants": [{"name": t["name"], "room": t["room"], "rent": t["rent"], "this_month": t["rent_status"], "pending": (t["due"] or 0) - (t["paid"] or 0)}
+                        for t in tenants_all()]}
+
+
+async def t_list_tickets(status="open"):
+    return {"tickets": q("select k.id,t.room,t.name,k.issue,k.status from tickets k left join tenants t on t.id=k.tenant_id where k.status=? order by k.id desc limit 15", (status,))}
+
+
+async def t_close_ticket(ticket_id):
+    if not q("select 1 from tickets where id=? and status='open'", (int(ticket_id),)):
+        raise ToolError(f"ticket {ticket_id} is not open")
+    q("update tickets set status='closed' where id=?", (int(ticket_id),))
+    audit("owner", "ticket_closed", {"id": int(ticket_id)})
+    return {"ticket_id": int(ticket_id), "status": "closed"}
+
+
+async def t_recent_payments(limit=5):
+    return {"payments": q("select t.name,t.room,p.paid amount,p.method,p.month,p.paid_ts,p.receipt_no from payments p join tenants t on t.id=p.tenant_id "
+                          "where p.status='paid' order by p.id desc limit ?", (min(int(limit), 15),))}
+
+
+async def t_month_ledger(month_):
+    ensure_month()
+    if not re.fullmatch(r"\d{4}-\d{2}", str(month_)):
+        raise ToolError("month must look like 2026-10")
+    rows = q("select t.name,t.room,l.due,l.paid,l.status from ledger l join tenants t on t.id=l.tenant_id where l.month=? order by t.room", (month_,))
+    if not rows:
+        raise ToolError(f"no rent records for {month_}")
+    return {"month": month_, "collected": sum(r["paid"] for r in rows), "pending": sum(r["due"] - r["paid"] for r in rows),
+            "unpaid": [f"{r['name']} {inr(r['due'] - r['paid'])}" for r in rows if r["paid"] < r["due"]]}
+
+
+def find_onboarding(name):
+    r = q("select * from onboarding where lower(name) like lower(?) order by id desc limit 1", (f"%{str(name).strip()}%",))
+    if not r:
+        raise ToolError(f"nobody called {name} is being onboarded")
+    return r[0]
+
+
+async def t_onboarding_status(name=None):
+    if name:
+        o = find_onboarding(name)
+        form = json.loads(o["form_json"] or "{}")
+        return {"onboarding": [{"name": o["name"], "room": o["room"], "status": o["status"], "call": o["call_outcome"],
+                                "form": {k: v for k, v in form.items() if v}, "has_aadhaar": bool(o["aadhaar_file"]), "has_photo": bool(o["photo_file"])}]}
+    return {"onboarding": q("select name,room,status from onboarding where status not in ('approved','rejected','declined','cancelled','pending_confirm') order by id desc limit 10")}
+
+
+async def t_onboarding_decide(name, action):
+    o = find_onboarding(name)
+    need = {"approve": ("submitted",), "reject": ("invited", "link_sent", "submitted"), "resend": ("invited", "link_sent")}
+    if action not in need:
+        raise ToolError("action must be approve, reject or resend")
+    if o["status"] not in need[action]:
+        raise ToolError(f"{o['name']} is {o['status']}; cannot {action}")
+    verb = {"approve": "Approve and add", "reject": "Reject", "resend": "Send the form link again to"}[action]
+    return stage({"approve": "approve_onboarding", "reject": "reject_onboarding", "resend": "resend_form"}[action], {"oid": o["id"]},
+                 f"{verb} {o['name']} for room {o['room']}")
+
+
+async def t_call_tenant(tenant_id):
+    t = tenant_row(int(tenant_id))
+    d = (await t_get_dues(t["id"]))["dues"]
+    if not d:
+        raise ToolError(f"{t['name']} has no pending rent")
+    return stage("call_tenant", {"tenant_ids": [t["id"]]}, f"Call {t['name']} in room {t['room']} about ₹{d[0]['pending']} pending rent")
+
+
+async def t_call_late_tenants():
+    d = (await t_get_dues())["dues"]
+    if not d:
+        raise ToolError("nobody has pending rent")
+    return stage("call_late", {}, f"Call {len(d)} tenants about rent: " + ", ".join(f"{x['name']} ₹{x['pending']}" for x in d))
+
+
+async def t_move_out_action(tenant_id, action):
+    t = tenant_row(int(tenant_id))
+    of = open_offboarding(t["id"])
+    if not of:
+        raise ToolError(f"{t['name']} has no move-out in progress")
+    f = ob_figures(of)
+    if action == "send_settlement":
+        if of["status"] not in ("notice", "proposed", "disputed"):
+            raise ToolError(f"cannot send a settlement while the move-out is {of['status']}")
+        return stage("send_settlement", {"oid": of["id"]}, f"Send {t['name']} the deposit settlement on WhatsApp: refund {inr(f['refund'])}" + (f", still owes {inr(f['shortfall'])}" if f["shortfall"] else ""))
+    if action == "complete":
+        if of["status"] != "accepted" or f["refund"] > 0:
+            raise ToolError("complete works only after the tenant accepted and no refund is due; for a refund use prepare_refund")
+        return stage("complete_move_out", {"oid": of["id"]}, f"Complete the move-out of {t['name']} and free the bed")
+    if action == "cancel":
+        return stage("cancel_move_out", {"oid": of["id"]}, f"Cancel the move-out of {t['name']}; they stay")
+    if action == "prepare_refund":
+        return await prepare_refund(of["id"])  # the payout itself still needs CONFIRM + PIN
+    raise ToolError("action must be send_settlement, complete, cancel or prepare_refund")
+
+
+async def t_offboarding_status2(tenant_id):
+    r = await t_offboarding_status(tenant_id)
+    of = q("select * from offboarding where tenant_id=? order by id desc limit 1", (int(tenant_id),))[0]
+    return {**r, "dispute_note": of["dispute_note"], "bank_last4": (of["bank_account"] or "")[-4:] or None, "refund_prepared": bool(of["payout_id"])}
+
+
+@app.post("/tickets/{tid}/close")
+async def ticket_close(tid: int):
+    try:
+        return await t_close_ticket(tid)
+    except ToolError as e:
+        raise HTTPException(400, str(e))
+
+
+TOOLS.update({
+    "rooms_status": (t_rooms_status, "Rooms, beds occupied, free beds, vacancies and who sleeps where.", P(), {"owner"}),
+    "list_tenants": (t_list_tenants, "List all current tenants with room and this month's rent status.", P(), {"owner"}),
+    "list_tickets": (t_list_tickets, "List open complaint tickets.", P(), {"owner"}),
+    "close_ticket": (t_close_ticket, "Close a complaint ticket by its number.", P(ticket_id="integer"), {"owner"}),
+    "recent_payments": (t_recent_payments, "Most recent rent payments received.", P(), {"owner"}),
+    "month_ledger": (t_month_ledger, "Rent collected, pending and unpaid tenants for any month, month_ as YYYY-MM.", P(month_="string"), {"owner"}),
+    "onboarding_status": (t_onboarding_status, "People being onboarded; give a name for the details of one (form answers, not files).", {"type": "object", "properties": {"name": {"type": "string"}}, "required": []}, {"owner"}),
+    "onboarding_decide": (t_onboarding_decide, "Stage approve, reject or resend for an onboarding person. Needs the owner's yes.", P(name="string", action="string"), {"owner"}),
+    "call_tenant": (t_call_tenant, "Stage a rent reminder phone call to ONE named tenant. For several or all tenants use call_late_tenants. Needs the owner's yes.", P(tenant_name="string"), {"owner"}),
+    "call_late_tenants": (t_call_late_tenants, "Stage rent reminder calls to ALL tenants with pending rent. Needs the owner's yes.", P(), {"owner"}),
+    "move_out_action": (t_move_out_action, "Move-out step: action is send_settlement, complete, cancel (each needs the owner's yes) or prepare_refund (then the owner sends CONFIRM and PIN).",
+                        P(tenant_name="string", action="string"), {"owner"}),
+})
+TOOLS["offboarding_status"] = (t_offboarding_status2, *TOOLS["offboarding_status"][1:])
+
+
+# ---------- PG enquiries: anyone who is not the owner or a tenant ----------
+def enquiry_facts():
+    f = pg_facts()
+    deps = ", ".join(f"{RATES[n]*2} ({n}-sharing)" for n in (2, 3, 4))
+    return (f"{PROPERTY['name']} is a paying guest (PG) hostel. Address: {f['property_address']}. {f['total_beds']} beds in {f['total_rooms']} rooms on 3 floors, "
+            f"{f['vacant_beds']} beds vacant now. Rent per bed per month: {RATES[2]} rupees for 2-sharing (floor 1), {RATES[3]} for 3-sharing (floor 2), "
+            f"{RATES[4]} for 4-sharing (floor 3). Security deposit is two months of rent: {deps} rupees. Vacancies: {f['vacancy_details']}")
+
+
+def enquiry_upsert(phone, text=None, name=None, note=None, source="whatsapp"):
+    r = q("select * from enquiries where phone=? and status='new' order by id desc limit 1", (phone,))
+    if not r:
+        q("insert into enquiries(phone,name,note,first_msg,source) values(?,?,?,?,?)", (phone, name, note, (text or "")[:300], source))
+        return q("select * from enquiries where id=?", (q.last,))[0], True
+    q("update enquiries set name=coalesce(?,name), note=coalesce(?,note), msgs=msgs+1, updated=datetime('now','localtime') where id=?", (name, note, r[0]["id"]))
+    return q("select * from enquiries where id=?", (r[0]["id"],))[0], False
+
+
+async def notify_owner_enquiry(e, headline):
+    detail = f"Contact: +91 {e['phone']}" + (f"\nName: {e['name']}" if e["name"] else "") + (f"\nWants: {e['note']}" if e["note"] else "") + (f"\nSaid: {e['first_msg']}" if e["first_msg"] else "")
+    await say(OWNER_PHONE, headline, "kn", "owner", True, detail)
+
+
+async def t_save_enquiry(phone, name="", note=""):
+    name = await english_name(name)
+    e, _ = enquiry_upsert(phone, name=str(name).strip()[:60] or None, note=str(note).strip()[:300] or None)
+    await notify_owner_enquiry(e, f"PG enquiry from {e['name'] or 'a new person'}.")
+    audit("enquirer", "enquiry_saved", {"id": e["id"], "phone_ending": phone[-4:]})
+    return {"saved": True}
+
+
+ENQUIRY_TOOL = [{"type": "function", "function": {
+    "name": "save_enquiry", "description": "Save the enquirer's name and what they are looking for, and tell the owner. Call once you know their name.",
+    "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "note": {"type": "string", "description": "sharing type, move-in date, budget, anything they asked for"}}, "required": ["name"]}}}]
+
+
+async def enquiry_quick(phone, text):
+    """Rent, deposit, vacancy and address questions in English are answered from the facts directly: no AI wait."""
+    t = text.lower()
+    if not text.isascii():
+        return None
+    f = pg_facts()
+    parts = []
+    if re.search(r"rent|price|cost|how much|charge|fee|tariff", t):
+        parts.append(f"Rent per bed per month: {RATES[2]} rupees for 2-sharing, {RATES[3]} for 3-sharing, {RATES[4]} for 4-sharing.")
+    if re.search(r"deposit|advance|security", t):
+        parts.append(f"Security deposit is two months of rent: {RATES[2]*2} (2-sharing), {RATES[3]*2} (3-sharing), {RATES[4]*2} (4-sharing) rupees.")
+    if re.search(r"vacan|available|free|empty|bed|room|space", t):
+        parts.append(f"{f['vacant_beds']} of {f['total_beds']} beds are vacant. {f['vacancy_details']}")
+    if re.search(r"address|location|where|situated|area", t):
+        parts.append(f"Address: {f['property_address']}.")
+    name = re.search(r"(?:my name is|i am|i'm|this is|name is)\s+([a-z][a-z ]{1,30})", t)
+    prior_asked = q("select 1 from messages where phone=? and role='enquirer' and direction='out' and text like '%your name%' order by id desc limit 1", (phone,))
+    bare = re.fullmatch(r"([a-z]{2,20}(?: [a-z]{2,20}){0,2})", t.strip(" ."))
+    if name or (prior_asked and bare and not parts and bare.group(1) not in ("yes", "no", "ok", "okay", "thanks", "thank you", "hi", "hello")):
+        who = (name.group(1) if name else bare.group(1)).title()
+        e, _ = enquiry_upsert(phone)
+        await t_save_enquiry(phone, who, e["first_msg"] if e else "")
+        parts.append(f"Thank you {who}. I have noted your enquiry and the owner will contact you soon.")
+    elif parts and not q("select 1 from enquiries where phone=? and name is not null", (phone,)):
+        parts.append("May I have your name so the owner can contact you?")
+    return " ".join(parts) or None
+
+
+async def enquiry_chat(phone, text):
+    """Answers a stranger's questions about the PG. Plain look-ups are answered from the facts above; no tenant data is ever reachable here."""
+    quick = await enquiry_quick(phone, text)
+    if quick:
+        return quick
+    hist = q("select direction,text from messages where phone=? and role='enquirer' order by id desc limit 8", (phone,))[::-1]
+    msgs = [{"role": "system", "content": (
+        "You are the enquiry assistant of a PG (paying guest hostel). The person writing is a prospective tenant, not a resident. Facts you may use, nothing else: "
+        + enquiry_facts() + ". Answer about rent, vacancies, deposit, sharing types and address, in one or two short sentences, no markdown. "
+        "Reply in the same language and script the person used. If you do not know their name, ask for it politely, then call save_enquiry with their name and what they want. "
+        "Never promise a room, never invent prices or facilities, never talk about residents or payments; for visits or bookings say the owner will contact them.")}]
+    msgs += [{"role": "assistant" if h["direction"] == "out" else "user", "content": h["text"]} for h in hist]
+    if not hist or hist[-1]["text"] != text:
+        msgs.append({"role": "user", "content": text})
+    if SK:
+        try:
+            for _ in range(3):
+                j = await sarvam("/v1/chat/completions", json={"model": LLM, "messages": msgs, "tools": ENQUIRY_TOOL, "temperature": 0.2})
+                m = j["choices"][0]["message"]
+                content = re.sub(r"<think>.*?</think>", "", m.get("content") or "", flags=re.S).strip()
+                if not m.get("tool_calls"):
+                    return content or "Thank you. The owner will contact you soon."
+                msgs.append({"role": "assistant", "content": content, "tool_calls": m["tool_calls"]})
+                for tc in m["tool_calls"]:
+                    a = json.loads(tc["function"].get("arguments") or "{}")
+                    res = await t_save_enquiry(phone, a.get("name", ""), a.get("note", "")) if tc["function"]["name"] == "save_enquiry" else {"error": "unknown tool"}
+                    msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(res)})
+        except Exception as e:
+            print("enquiry llm failed:", e)
+    return (f"Welcome to {PROPERTY['name']}! Rent per bed per month: {RATES[2]} (2-sharing), {RATES[3]} (3-sharing), {RATES[4]} (4-sharing). "
+            f"Deposit is two months of rent. {pg_facts()['vacant_beds']} beds are vacant. May I have your name? The owner will contact you.")
+
+
+async def handle_enquiry(phone, kind, text, media, wa_id, deliver):
+    day = q("select count(*) n from messages where phone=? and role='enquirer' and direction='in' and ts > datetime('now','-1 day')", (phone,))[0]["n"]
+    if day >= 40:  # a stranger cannot run up the AI bill
+        return
+    try:
+        said = await transcribe(media[0] if media else None, *(media[1:] if media else (None, None)), text)
+    except Exception:
+        return await wa_send(phone, "Sorry, I could not understand that voice note. Please type your question.") if deliver and WA_TOKEN else None
+    if not (said or "").strip():
+        return
+    log_msg(phone, "enquirer", "in", kind, said, wa_id=wa_id)
+    e, first = enquiry_upsert(phone, said)
+    if first:
+        asyncio.create_task(notify_owner_enquiry(e, "A new person is asking about the PG."))
+    reply = await enquiry_chat(phone, said)
+    log_msg(phone, "enquirer", "out", "text", reply)
+    if deliver and WA_TOKEN:
+        await wa_send(phone, reply)
+
+
+@app.get("/enquiries")
+def enquiries_list():
+    return q("select * from enquiries order by id desc limit 100")
+
+
+@app.post("/enquiries/{eid}/close")
+def enquiry_close(eid: int):
+    q("update enquiries set status='closed' where id=?", (eid,))
+    return {"status": "closed"}
+
+
+@app.get("/webhooks/sarvam/facts")
+def sarvam_facts(k: str = ""):
+    """Live vacancies and address for the enquiry part of the phone agent (read by an API tool on the agent)."""
+    if not hmac.compare_digest(k, voice_key()):
+        raise HTTPException(403, "bad key")
+    return pg_facts()
+
+
+@app.get("/webhooks/sarvam/payment-check")
+def sarvam_payment_check(k: str = "", tenant_name: str = "", room: str = ""):
+    """Read by the rent-collection agent when a tenant says they already paid: what does the ledger say for this month?"""
+    if not hmac.compare_digest(k, voice_key()):
+        raise HTTPException(403, "bad key")
+    ensure_month()
+    r = q("select * from tenants where status='active' and lower(name)=lower(?) and room=?", (tenant_name.strip(), room.strip()))
+    if not r:
+        return {"status": "unknown", "message": "I could not find your record to check."}
+    t = r[0]
+    led = q("select due,paid from ledger where tenant_id=? and month=?", (t["id"], month()))
+    due, paid = (led[0]["due"], led[0]["paid"]) if led else (t["rent"], 0)
+    last = q("select paid,method,paid_ts from payments where tenant_id=? and month=? and paid>0 order by id desc limit 1", (t["id"], month()))
+    when = (last[0]["paid_ts"] or "")[:10] if last else ""
+    how = (last[0]["method"] or "online") if last else ""
+    if paid >= due:
+        msg = f"I checked our records, and your rent of {paid} rupees for this month was received" + (f" on {when}" if when else "") + (f" by {how}" if how and how != "online" else "") + ". Thank you."
+        return {"status": "paid", "message": msg}
+    if paid > 0:
+        return {"status": "partial", "message": f"I checked our records. {paid} rupees is received this month, and {due - paid} rupees is still pending."}
+    return {"status": "unpaid", "message": "I checked our records, and I do not see any payment for this month yet."}

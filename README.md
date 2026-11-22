@@ -1,4 +1,4 @@
-# Kiraya Mitra
+# Nele
 
 Voice agent for PG owners: collect rent, chase late payers, pay vendors, settle deposits. Sarvam (Saaras/Sarvam-105B/Bulbul/Mayura) + Cashfree (Payment Links, Payouts, Verification).
 
@@ -35,7 +35,7 @@ For business-initiated WhatsApp payment links outside the 24-hour customer-servi
 
 Create a separate Sarvam Voice Agent for the owner, commit a version, and put its ID/version in `SARVAM_OWNER_APP_ID` and `SARVAM_OWNER_APP_VERSION`. Add only the required backend actions as Sarvam HTTP tools: `POST {PUBLIC_URL}/voice-tools/{tool_name}` with JSON arguments and header `X-Voice-Key: {SARVAM_VOICE_TOOL_SECRET}`. Use the names and schemas in `TOOLS` in `app.py`; the usual set is `get_dues`, `tenant_info`, `monthly_summary`, `send_reminders`, `record_payment`, `start_onboarding`, `start_offboarding`, `finish_offboarding`, and `prepare_payout`. Never expose `/payouts/confirm` to the voice agent.
 
-The agent should speak Kannada/English, identify itself as Kiraya Mitra for the configured property, use a tool for every factual or mutating answer, read back prepared payouts, and tell the owner to confirm them in the dashboard. The completion webhook is supplied automatically when the dashboard places the call.
+The agent should speak Kannada/English, identify itself as Nele for the configured property, use a tool for every factual or mutating answer, read back prepared payouts, and tell the owner to confirm them in the dashboard. The completion webhook is supplied automatically when the dashboard places the call.
 
 ## Demo
 Owner chips: "Yaaru innu kottilla?" -> "Ellarigu reminder kalsi" -> tenant (Ankit 204) "Half now, half Friday" -> open link, pay -> owner screen turns green + Kannada announcement -> "Electrician Raju ge 800 kodi" -> enter PIN `1234`, Confirm.
@@ -45,3 +45,13 @@ Payouts only to verified saved payees; LLM can only *prepare* a payout, money mo
 
 ## Not built
 Sarvam Vision ID scan, dashboard login/auth, tenant move-out UI. Voice replies from tenants on calls (keypad only for now).
+
+## Where the Cashfree work plugs in
+Everything money-related goes through five functions in `app.py`; each runs in mock mode until `CASHFREE_CLIENT_ID` and `CASHFREE_CLIENT_SECRET` are set.
+| Function | Used for | Cashfree product |
+|---|---|---|
+| `make_link` | rent, deposit and part-payment links | Payment Links |
+| `apply_payment` (called by `/webhooks/cashfree/payment`) | marks rent paid, sends receipts | Payment webhooks |
+| `t_verify_payee` | checks a bank account before any payout, including the tenant's deposit refund account | Verification (bank account) |
+| `t_prepare_payout` + `confirm_payout` | vendor payments and deposit refunds; money moves only after the owner's PIN | Payouts |
+Move-outs (`/offboarding`) call `t_verify_payee` when the tenant submits bank details and `t_prepare_payout` / `confirm_payout` (kind `deposit`) for the refund, so nothing in the move-out flow needs to change when these go live. Deposit refunds have their own daily cap, `DEPOSIT_PAYOUT_LIMIT` (default 100000).

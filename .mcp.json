@@ -5,7 +5,12 @@
       "url": "https://mcp.sarvam.ai/voice-agents"
     },
     "cashfree": {
+      "type": "http",
       "url": "https://mcp.cashfree.com/mcp"
+    },
+    "whatsapp-business-tools": {
+      "type": "http",
+      "url": "https://mcp.facebook.com/whatsapp_business_tools"
     }
   }
 }

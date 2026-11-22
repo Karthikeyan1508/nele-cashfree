@@ -6,7 +6,7 @@ import { Separator } from "@/components/ui/separator"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 
 const TITLES: Record<string, string> = {
-  "": "Overview", tenants: "Tenants", onboarding: "Onboarding", rooms: "Rooms", ledger: "Rent ledger", activity: "Activity log", whatsapp: "WhatsApp agent",
+  "": "Overview", tenants: "Tenants", onboarding: "Onboarding", offboarding: "Move-outs", rooms: "Rooms", ledger: "Rent ledger", activity: "Activity log", whatsapp: "WhatsApp agent",
 }
 
 export function AppHeader() {
@@ -18,7 +18,7 @@ export function AppHeader() {
       <Separator orientation="vertical" className="h-5" />
       <Breadcrumb>
         <BreadcrumbList>
-          <BreadcrumbItem><BreadcrumbLink render={<Link href="/" />}>Kiraya Mitra</BreadcrumbLink></BreadcrumbItem>
+          <BreadcrumbItem><BreadcrumbLink render={<Link href="/" />}>Nele</BreadcrumbLink></BreadcrumbItem>
           <BreadcrumbSeparator />
           <BreadcrumbItem>{child ? <BreadcrumbLink render={<Link href={`/${section}`} />}>{title}</BreadcrumbLink> : <BreadcrumbPage>{title}</BreadcrumbPage>}</BreadcrumbItem>
           {child && <><BreadcrumbSeparator /><BreadcrumbItem><BreadcrumbPage>Details</BreadcrumbPage></BreadcrumbItem></>}
